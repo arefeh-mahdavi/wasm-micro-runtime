@@ -30,6 +30,10 @@ typedef int64 CellType_I64;
 typedef float32 CellType_F32;
 typedef float64 CellType_F64;
 
+#define USE_ACCELERATOR
+
+#ifdef USE_ACCELERATOR
+/* Hardware accelerator CSR definitions */
 #define CSR_HANDLER_TBL 0x7C4
 #define CSR_FRAME_IP    0x7C1 
 #define CSR_CONFIG      0x7C3
@@ -43,6 +47,24 @@ void wasm_accelerator_init(void) {
     uint32_t config = 0x1;
     asm volatile("csrw %0, %1" :: "i"(CSR_CONFIG), "r"(config));
 }
+
+
+#define START_ACCELERATOR(fip, inc)              \
+    do {                                         \
+        asm volatile("csrw %0, %1" ::            \
+            "i"(CSR_FRAME_IP), "r"(fip));        \
+        asm volatile("csrw %0, %1" ::            \
+            "i"(CSR_INC), "r"(inc));             \
+    } while(0)
+
+
+#define HANDLE_OP_END_ACCELERATED() FETCH_OPCODE_AND_DISPATCH_ACCELERATED()
+
+#else /* No accelerator */
+#define START_ACCELERATOR(fip, inc) do {} while(0)
+#define HANDLE_OP_END_ACCELERATED() HANDLE_OP_END()
+
+#endif /* USE_ACCELERATOR */
 
 
 #if WASM_ENABLE_THREAD_MGR == 0
@@ -1482,6 +1504,7 @@ wasm_interp_dump_op_count()
         goto *p_label_addr;                                              \
     } while (0)
 
+#ifdef USE_ACCELERATOR
 #define FETCH_OPCODE_AND_DISPATCH_ACCELERATED()    \
     do {                                           \
         /* Read back updated frame_ip from CSR BEFORE jump */  \
@@ -1489,17 +1512,12 @@ wasm_interp_dump_op_count()
         /* WASM jump instruction (doesn't return!) */          \
         asm(".word 0x7b");                         \
     } while (0)
+#endif /* USE_ACCELERATOR */
+
 #endif
 #endif /* end of WASM_CPU_SUPPORTS_UNALIGNED_ADDR_ACCESS */
 #define HANDLE_OP_END() FETCH_OPCODE_AND_DISPATCH()
-#define HANDLE_OP_END_ACCELERATED() FETCH_OPCODE_AND_DISPATCH_ACCELERATED()
-#define START_ACCELERATOR(fip, inc)          \
-    do {                                     \
-        asm volatile("csrw %0, %1" ::        \
-            "i"(CSR_FRAME_IP), "r"(fip));    \
-        asm volatile("csrw %0, %1" ::        \
-            "i"(CSR_INC), "r"(inc));         \
-    } while(0)
+
 #else /* else of WASM_ENABLE_LABELS_AS_VALUES */
 
 #define HANDLE_OP(opcode) case opcode:
@@ -1626,12 +1644,14 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
     }
 #endif
 
+#ifdef USE_ACCELERATOR
     /* Initialize hardware accelerator (only once, first time called) */
     static int accelerator_initialized = 0;
     if (!accelerator_initialized) {
         wasm_accelerator_init();
         accelerator_initialized = 1;
     }
+#endif /* USE_ACCELERATOR */
 
 #if WASM_ENABLE_LABELS_AS_VALUES == 0
     while (frame_ip < frame_ip_end) {
@@ -3784,7 +3804,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 CHECK_MEMORY_OVERFLOW(4);
                 frame_lp[addr_ret] = LOAD_I32(maddr);
                 //HANDLE_OP_END();
-                FETCH_OPCODE_AND_DISPATCH_ACCELERATED();
+                HANDLE_OP_END_ACCELERATED();
             }
 
             HANDLE_OP(WASM_OP_I64_LOAD)
@@ -4087,7 +4107,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 START_ACCELERATOR(frame_ip, 4);
                 DEF_OP_EQZ(int32, I32);
                 //HANDLE_OP_END();
-                FETCH_OPCODE_AND_DISPATCH_ACCELERATED();
+                HANDLE_OP_END_ACCELERATED();
             }
 
             HANDLE_OP(WASM_OP_I32_EQ)
@@ -4096,7 +4116,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 START_ACCELERATOR(frame_ip, 6);
                 DEF_OP_CMP(uint32, I32, ==);
                 //HANDLE_OP_END();
-                FETCH_OPCODE_AND_DISPATCH_ACCELERATED();
+                HANDLE_OP_END_ACCELERATED();
             }
 
             HANDLE_OP(WASM_OP_I32_NE)
@@ -4105,7 +4125,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 START_ACCELERATOR(frame_ip, 6);
                 DEF_OP_CMP(uint32, I32, !=);
                 //HANDLE_OP_END();
-                FETCH_OPCODE_AND_DISPATCH_ACCELERATED();
+                HANDLE_OP_END_ACCELERATED();
                
             }
 
@@ -4115,7 +4135,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 START_ACCELERATOR(frame_ip, 6);
                 DEF_OP_CMP(int32, I32, <);
                 // HANDLE_OP_END();
-                FETCH_OPCODE_AND_DISPATCH_ACCELERATED();
+                HANDLE_OP_END_ACCELERATED();
             }
 
             HANDLE_OP(WASM_OP_I32_LT_U)
@@ -4124,7 +4144,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 START_ACCELERATOR(frame_ip, 6);
                 DEF_OP_CMP(uint32, I32, <);
                 //HANDLE_OP_END();
-                FETCH_OPCODE_AND_DISPATCH_ACCELERATED();
+                HANDLE_OP_END_ACCELERATED();
                 
             }
 
@@ -4134,7 +4154,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 START_ACCELERATOR(frame_ip, 6);
                 DEF_OP_CMP(int32, I32, >);
                 // HANDLE_OP_END();
-                FETCH_OPCODE_AND_DISPATCH_ACCELERATED();
+                HANDLE_OP_END_ACCELERATED();
             }
 
             HANDLE_OP(WASM_OP_I32_GT_U)
@@ -4143,7 +4163,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 START_ACCELERATOR(frame_ip, 6);
                 DEF_OP_CMP(uint32, I32, >);
                 // HANDLE_OP_END();
-                FETCH_OPCODE_AND_DISPATCH_ACCELERATED();
+                HANDLE_OP_END_ACCELERATED();
             }
 
             HANDLE_OP(WASM_OP_I32_LE_S)
@@ -4152,7 +4172,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 START_ACCELERATOR(frame_ip, 6);
                 DEF_OP_CMP(int32, I32, <=);
                 // HANDLE_OP_END();
-                FETCH_OPCODE_AND_DISPATCH_ACCELERATED();
+                HANDLE_OP_END_ACCELERATED();
             }
 
             HANDLE_OP(WASM_OP_I32_LE_U)
@@ -4161,7 +4181,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 START_ACCELERATOR(frame_ip, 6);
                 DEF_OP_CMP(uint32, I32, <=);
                 // HANDLE_OP_END();
-                FETCH_OPCODE_AND_DISPATCH_ACCELERATED();
+                HANDLE_OP_END_ACCELERATED();
             }
 
             HANDLE_OP(WASM_OP_I32_GE_S)
@@ -4170,7 +4190,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 START_ACCELERATOR(frame_ip, 6);
                 DEF_OP_CMP(int32, I32, >=);
                 // HANDLE_OP_END();
-                FETCH_OPCODE_AND_DISPATCH_ACCELERATED();
+                HANDLE_OP_END_ACCELERATED();
             }
 
             HANDLE_OP(WASM_OP_I32_GE_U)
@@ -4179,7 +4199,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 START_ACCELERATOR(frame_ip, 6);
                 DEF_OP_CMP(uint32, I32, >=);
                 // HANDLE_OP_END();
-                FETCH_OPCODE_AND_DISPATCH_ACCELERATED();
+                HANDLE_OP_END_ACCELERATED();
                 
             }
 
@@ -4348,8 +4368,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 printf("I32_ADD executed\n");
                 START_ACCELERATOR(frame_ip, 6);
                 DEF_OP_NUMERIC(uint32, uint32, I32, +);
-                // HANDLE_OP_END();
-                FETCH_OPCODE_AND_DISPATCH_ACCELERATED();
+                HANDLE_OP_END_ACCELERATED();
             }
 
             HANDLE_OP(WASM_OP_I32_SUB)
@@ -4357,9 +4376,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 printf("I32_SUB executed\n");
                 START_ACCELERATOR(frame_ip, 6);
                 DEF_OP_NUMERIC(uint32, uint32, I32, -);
-                // HANDLE_OP_END();
-                FETCH_OPCODE_AND_DISPATCH_ACCELERATED();
-               
+                HANDLE_OP_END_ACCELERATED();
             }
 
             HANDLE_OP(WASM_OP_I32_MUL)
@@ -4367,8 +4384,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 printf("I32_MUL executed\n");
                 START_ACCELERATOR(frame_ip, 6);
                 DEF_OP_NUMERIC(uint32, uint32, I32, *);
-                // HANDLE_OP_END();
-                FETCH_OPCODE_AND_DISPATCH_ACCELERATED();
+                HANDLE_OP_END_ACCELERATED();
             }
 
             HANDLE_OP(WASM_OP_I32_DIV_S)
@@ -4454,7 +4470,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 START_ACCELERATOR(frame_ip, 6);
                 DEF_OP_NUMERIC(uint32, uint32, I32, &);
                 // HANDLE_OP_END();
-                FETCH_OPCODE_AND_DISPATCH_ACCELERATED();
+                HANDLE_OP_END_ACCELERATED();
             }
 
             HANDLE_OP(WASM_OP_I32_OR)
@@ -4463,7 +4479,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 START_ACCELERATOR(frame_ip, 6);
                 DEF_OP_NUMERIC(uint32, uint32, I32, |);
                 // HANDLE_OP_END();
-                FETCH_OPCODE_AND_DISPATCH_ACCELERATED();
+                HANDLE_OP_END_ACCELERATED();
             }
 
             HANDLE_OP(WASM_OP_I32_XOR)
@@ -4472,7 +4488,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 START_ACCELERATOR(frame_ip, 6);
                 DEF_OP_NUMERIC(uint32, uint32, I32, ^);
                 // HANDLE_OP_END();
-                FETCH_OPCODE_AND_DISPATCH_ACCELERATED();
+                HANDLE_OP_END_ACCELERATED();
             }
 
             HANDLE_OP(WASM_OP_I32_SHL)
