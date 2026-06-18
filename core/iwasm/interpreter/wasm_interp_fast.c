@@ -33,38 +33,35 @@ typedef float64 CellType_F64;
 #define USE_ACCELERATOR
 
 #ifdef USE_ACCELERATOR
-/* Hardware accelerator CSR definitions */
-#define CSR_HANDLER_TBL 0x7C4
-#define CSR_FRAME_IP    0x7C1 
-#define CSR_CONFIG      0x7C3
-#define CSR_INC         0x7C0
-#define CSR_ACC_BUSY    0x7C5
-#define CSR_HANDLER     0x7C2
-#define WASM_JUMP_INST 0x0000007b
+    /* Hardware accelerator CSR definitions */
+    #define CSR_HANDLER_TBL 0x7C4
+    #define CSR_FRAME_IP    0x7C1 
+    #define CSR_CONFIG      0x7C3
+    #define CSR_INC         0x7C0
+    #define CSR_ACC_BUSY    0x7C5
+    #define CSR_HANDLER     0x7C2
+    #define WASM_JUMP_INST 0x0000007b
 
 
-void wasm_accelerator_init(void) {
-    uint32_t config = 0x1;
-    asm volatile("csrw %0, %1" :: "i"(CSR_CONFIG), "r"(config));
-}
-
-
-#define START_ACCELERATOR(fip, inc)              \
-    do {                                         \
-        asm volatile("csrw %0, %1" ::            \
-            "i"(CSR_FRAME_IP), "r"(fip));        \
-        asm volatile("csrw %0, %1" ::            \
-            "i"(CSR_INC), "r"(inc));             \
+    #define TRIGGER_ACCELERATOR(fip, inc) do { \
+        asm volatile("csrw %0, %1" :: "i"(CSR_FRAME_IP), "r"((uint32_t)(uintptr_t)(fip))); \
+        asm volatile("csrw %0, %1" :: "i"(CSR_INC),      "r"((uint32_t)(inc)));             \
     } while(0)
 
+    #define ACCELERATED_OP_END()                                       \
+        do {                                                                   \
+            frame_ip = (uint8 *)(uintptr_t)({                                 \
+                uint32_t _v;                                                   \
+                asm volatile("csrr %0, %1" : "=r"(_v) : "i"(CSR_FRAME_IP));  \
+                _v;                                                            \
+            });                                                                \
+            asm volatile(".word %0" :: "i"(WASM_JUMP_INST));                  \
+        } while (0)
 
-#define HANDLE_OP_END_ACCELERATED() FETCH_OPCODE_AND_DISPATCH_ACCELERATED()
-
-#else /* No accelerator */
-#define START_ACCELERATOR(fip, inc) do {} while(0)
-#define HANDLE_OP_END_ACCELERATED() HANDLE_OP_END()
-
-#endif /* USE_ACCELERATOR */
+#else
+    #define TRIGGER_ACCELERATOR(fip, inc) 
+    #define ACCELERATED_OP_END() HANDLE_OP_END()
+#endif
 
 
 #if WASM_ENABLE_THREAD_MGR == 0
@@ -3794,8 +3791,8 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             /* memory load instructions */
             HANDLE_OP(WASM_OP_I32_LOAD)
             {
-                printf("I32_LOAD executed\n");
-                START_ACCELERATOR(frame_ip, 8);
+                // printf("I32_LOAD executed\n");
+                TRIGGER_ACCELERATOR(frame_ip, 8);
                 uint32 offset, addr;
                 offset = read_uint32(frame_ip);
                 addr = GET_OPERAND(uint32, I32, 0);
@@ -3804,11 +3801,12 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 CHECK_MEMORY_OVERFLOW(4);
                 frame_lp[addr_ret] = LOAD_I32(maddr);
                 //HANDLE_OP_END();
-                HANDLE_OP_END_ACCELERATED();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_LOAD)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 8);
                 uint32 offset, addr;
                 offset = read_uint32(frame_ip);
                 addr = GET_OPERAND(uint32, I32, 0);
@@ -3816,11 +3814,13 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 addr_ret = GET_OFFSET();
                 CHECK_MEMORY_OVERFLOW(8);
                 PUT_I64_TO_ADDR(frame_lp + addr_ret, LOAD_I64(maddr));
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_LOAD8_S)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 8);
                 uint32 offset, addr;
                 offset = read_uint32(frame_ip);
                 addr = GET_OPERAND(uint32, I32, 0);
@@ -3828,11 +3828,13 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 addr_ret = GET_OFFSET();
                 CHECK_MEMORY_OVERFLOW(1);
                 frame_lp[addr_ret] = sign_ext_8_32(*(int8 *)maddr);
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_LOAD8_U)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 8);
                 uint32 offset, addr;
                 offset = read_uint32(frame_ip);
                 addr = GET_OPERAND(uint32, I32, 0);
@@ -3840,11 +3842,13 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 addr_ret = GET_OFFSET();
                 CHECK_MEMORY_OVERFLOW(1);
                 frame_lp[addr_ret] = (uint32)(*(uint8 *)(maddr));
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_LOAD16_S)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 8);
                 uint32 offset, addr;
                 offset = read_uint32(frame_ip);
                 addr = GET_OPERAND(uint32, I32, 0);
@@ -3852,11 +3856,13 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 addr_ret = GET_OFFSET();
                 CHECK_MEMORY_OVERFLOW(2);
                 frame_lp[addr_ret] = sign_ext_16_32(LOAD_I16(maddr));
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_LOAD16_U)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 8);
                 uint32 offset, addr;
                 offset = read_uint32(frame_ip);
                 addr = GET_OPERAND(uint32, I32, 0);
@@ -3864,11 +3870,13 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 addr_ret = GET_OFFSET();
                 CHECK_MEMORY_OVERFLOW(2);
                 frame_lp[addr_ret] = (uint32)(LOAD_U16(maddr));
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_LOAD8_S)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 8);
                 uint32 offset, addr;
                 offset = read_uint32(frame_ip);
                 addr = GET_OPERAND(uint32, I32, 0);
@@ -3877,11 +3885,13 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 CHECK_MEMORY_OVERFLOW(1);
                 PUT_I64_TO_ADDR(frame_lp + addr_ret,
                                 sign_ext_8_64(*(int8 *)maddr));
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_LOAD8_U)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 8);
                 uint32 offset, addr;
                 offset = read_uint32(frame_ip);
                 addr = GET_OPERAND(uint32, I32, 0);
@@ -3889,11 +3899,13 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 addr_ret = GET_OFFSET();
                 CHECK_MEMORY_OVERFLOW(1);
                 PUT_I64_TO_ADDR(frame_lp + addr_ret, (uint64)(*(uint8 *)maddr));
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_LOAD16_S)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 8);
                 uint32 offset, addr;
                 offset = read_uint32(frame_ip);
                 addr = GET_OPERAND(uint32, I32, 0);
@@ -3902,11 +3914,13 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 CHECK_MEMORY_OVERFLOW(2);
                 PUT_I64_TO_ADDR(frame_lp + addr_ret,
                                 sign_ext_16_64(LOAD_I16(maddr)));
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_LOAD16_U)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 8);
                 uint32 offset, addr;
                 offset = read_uint32(frame_ip);
                 addr = GET_OPERAND(uint32, I32, 0);
@@ -3914,11 +3928,13 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 addr_ret = GET_OFFSET();
                 CHECK_MEMORY_OVERFLOW(2);
                 PUT_I64_TO_ADDR(frame_lp + addr_ret, (uint64)(LOAD_U16(maddr)));
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_LOAD32_S)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 8);
                 uint32 offset, addr;
                 offset = read_uint32(frame_ip);
                 addr = GET_OPERAND(uint32, I32, 0);
@@ -3927,11 +3943,13 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 CHECK_MEMORY_OVERFLOW(4);
                 PUT_I64_TO_ADDR(frame_lp + addr_ret,
                                 sign_ext_32_64(LOAD_I32(maddr)));
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_LOAD32_U)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 8);
                 uint32 offset, addr;
                 offset = read_uint32(frame_ip);
                 addr = GET_OPERAND(uint32, I32, 0);
@@ -3939,11 +3957,13 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 addr_ret = GET_OFFSET();
                 CHECK_MEMORY_OVERFLOW(4);
                 PUT_I64_TO_ADDR(frame_lp + addr_ret, (uint64)(LOAD_U32(maddr)));
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_STORE)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 8);
                 uint32 offset, addr;
                 uint32 sval;
                 offset = read_uint32(frame_ip);
@@ -3952,11 +3972,13 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 frame_ip += 4;
                 CHECK_MEMORY_OVERFLOW(4);
                 STORE_U32(maddr, sval);
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_STORE8)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 8);
                 uint32 offset, addr;
                 uint32 sval;
                 offset = read_uint32(frame_ip);
@@ -3965,11 +3987,13 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 frame_ip += 4;
                 CHECK_MEMORY_OVERFLOW(1);
                 STORE_U8(maddr, (uint8_t)sval);
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_STORE16)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 8);
                 uint32 offset, addr;
                 uint32 sval;
                 offset = read_uint32(frame_ip);
@@ -3978,11 +4002,13 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 frame_ip += 4;
                 CHECK_MEMORY_OVERFLOW(2);
                 STORE_U16(maddr, (uint16)sval);
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_STORE)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 8);
                 uint32 offset, addr;
                 uint64 sval;
                 offset = read_uint32(frame_ip);
@@ -3991,11 +4017,13 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 frame_ip += 4;
                 CHECK_MEMORY_OVERFLOW(8);
                 STORE_I64(maddr, sval);
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_STORE8)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 8);
                 uint32 offset, addr;
                 uint64 sval;
                 offset = read_uint32(frame_ip);
@@ -4004,11 +4032,13 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 frame_ip += 4;
                 CHECK_MEMORY_OVERFLOW(1);
                 *(uint8 *)maddr = (uint8)sval;
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_STORE16)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 8);
                 uint32 offset, addr;
                 uint64 sval;
                 offset = read_uint32(frame_ip);
@@ -4017,11 +4047,13 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 frame_ip += 4;
                 CHECK_MEMORY_OVERFLOW(2);
                 STORE_U16(maddr, (uint16)sval);
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_STORE32)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 8);
                 uint32 offset, addr;
                 uint64 sval;
                 offset = read_uint32(frame_ip);
@@ -4030,7 +4062,8 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 frame_ip += 4;
                 CHECK_MEMORY_OVERFLOW(4);
                 STORE_U32(maddr, (uint32)sval);
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             /* memory size and memory grow instructions */
@@ -4103,171 +4136,193 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             /* comparison instructions of i32 */
             HANDLE_OP(WASM_OP_I32_EQZ)
             {
-                printf("I32_EQZ executed\n");
-                START_ACCELERATOR(frame_ip, 4);
+                // printf("I32_EQZ executed\n");
+                TRIGGER_ACCELERATOR(frame_ip, 4);
                 DEF_OP_EQZ(int32, I32);
                 //HANDLE_OP_END();
-                HANDLE_OP_END_ACCELERATED();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_EQ)
             {
-                printf("I32_EQ executed\n");
-                START_ACCELERATOR(frame_ip, 6);
+                // printf("I32_EQ executed\n");
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_CMP(uint32, I32, ==);
                 //HANDLE_OP_END();
-                HANDLE_OP_END_ACCELERATED();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_NE)
             {
-                printf("I32_NE executed\n");
-                START_ACCELERATOR(frame_ip, 6);
+                // printf("I32_NE executed\n");
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_CMP(uint32, I32, !=);
                 //HANDLE_OP_END();
-                HANDLE_OP_END_ACCELERATED();
+                ACCELERATED_OP_END();
                
             }
 
             HANDLE_OP(WASM_OP_I32_LT_S)
             {
-                printf("I32_LT_S executed\n");
-                START_ACCELERATOR(frame_ip, 6);
+                // printf("I32_LT_S executed\n");
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_CMP(int32, I32, <);
                 // HANDLE_OP_END();
-                HANDLE_OP_END_ACCELERATED();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_LT_U)
             {
-                printf("I32_LT_U executed\n");
-                START_ACCELERATOR(frame_ip, 6);
+                // printf("I32_LT_U executed\n");
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_CMP(uint32, I32, <);
                 //HANDLE_OP_END();
-                HANDLE_OP_END_ACCELERATED();
+                ACCELERATED_OP_END();
                 
             }
 
             HANDLE_OP(WASM_OP_I32_GT_S)
             {
-                printf("I32_GT_S executed\n");
-                START_ACCELERATOR(frame_ip, 6);
+                // printf("I32_GT_S executed\n");
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_CMP(int32, I32, >);
                 // HANDLE_OP_END();
-                HANDLE_OP_END_ACCELERATED();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_GT_U)
             {
-                printf("I32_GT_U executed\n");
-                START_ACCELERATOR(frame_ip, 6);
+                // printf("I32_GT_U executed\n");
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_CMP(uint32, I32, >);
                 // HANDLE_OP_END();
-                HANDLE_OP_END_ACCELERATED();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_LE_S)
             {
-                printf("I32_LE_S executed\n");
-                START_ACCELERATOR(frame_ip, 6);
+                // printf("I32_LE_S executed\n");
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_CMP(int32, I32, <=);
                 // HANDLE_OP_END();
-                HANDLE_OP_END_ACCELERATED();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_LE_U)
             {
-                printf("I32_LE_U executed\n");
-                START_ACCELERATOR(frame_ip, 6);
+                // printf("I32_LE_U executed\n");
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_CMP(uint32, I32, <=);
                 // HANDLE_OP_END();
-                HANDLE_OP_END_ACCELERATED();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_GE_S)
             {
-                printf("I32_GE_S executed\n");
-                START_ACCELERATOR(frame_ip, 6);
+                // printf("I32_GE_S executed\n");
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_CMP(int32, I32, >=);
                 // HANDLE_OP_END();
-                HANDLE_OP_END_ACCELERATED();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_GE_U)
             {
-                printf("I32_GE_U executed\n");
-                START_ACCELERATOR(frame_ip, 6);
+                // printf("I32_GE_U executed\n");
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_CMP(uint32, I32, >=);
                 // HANDLE_OP_END();
-                HANDLE_OP_END_ACCELERATED();
+                ACCELERATED_OP_END();
                 
             }
 
             /* comparison instructions of i64 */
             HANDLE_OP(WASM_OP_I64_EQZ)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 4);
                 DEF_OP_EQZ(int64, I64);
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_EQ)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_CMP(uint64, I64, ==);
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_NE)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_CMP(uint64, I64, !=);
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_LT_S)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_CMP(int64, I64, <);
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_LT_U)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_CMP(uint64, I64, <);
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_GT_S)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_CMP(int64, I64, >);
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_GT_U)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_CMP(uint64, I64, >);
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_LE_S)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_CMP(int64, I64, <=);
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_LE_U)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_CMP(uint64, I64, <=);
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_GE_S)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_CMP(int64, I64, >=);
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_GE_U)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_CMP(uint64, I64, >=);
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             /* comparison instructions of f32 */
@@ -4365,26 +4420,26 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_I32_ADD)
             {
-                printf("I32_ADD executed\n");
-                START_ACCELERATOR(frame_ip, 6);
+                // printf("I32_ADD executed\n");
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_NUMERIC(uint32, uint32, I32, +);
-                HANDLE_OP_END_ACCELERATED();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_SUB)
             {
-                printf("I32_SUB executed\n");
-                START_ACCELERATOR(frame_ip, 6);
+                // printf("I32_SUB executed\n");
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_NUMERIC(uint32, uint32, I32, -);
-                HANDLE_OP_END_ACCELERATED();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_MUL)
             {
-                printf("I32_MUL executed\n");
-                START_ACCELERATOR(frame_ip, 6);
+                // printf("I32_MUL executed\n");
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_NUMERIC(uint32, uint32, I32, *);
-                HANDLE_OP_END_ACCELERATED();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_DIV_S)
@@ -4466,67 +4521,77 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_I32_AND)
             {
-                printf("I32_AND executed\n");
-                START_ACCELERATOR(frame_ip, 6);
+                // printf("I32_AND executed\n");
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_NUMERIC(uint32, uint32, I32, &);
                 // HANDLE_OP_END();
-                HANDLE_OP_END_ACCELERATED();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_OR)
             {
-                printf("I32_OR executed\n");
-                START_ACCELERATOR(frame_ip, 6);
+                // printf("I32_OR executed\n");
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_NUMERIC(uint32, uint32, I32, |);
                 // HANDLE_OP_END();
-                HANDLE_OP_END_ACCELERATED();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_XOR)
             {
-                printf("I32_XOR executed\n");
-                START_ACCELERATOR(frame_ip, 6);
+                // printf("I32_XOR executed\n");
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_NUMERIC(uint32, uint32, I32, ^);
                 // HANDLE_OP_END();
-                HANDLE_OP_END_ACCELERATED();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_SHL)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_NUMERIC2(uint32, uint32, I32, <<);
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_SHR_S)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_NUMERIC2(int32, uint32, I32, >>);
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_SHR_U)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_NUMERIC2(uint32, uint32, I32, >>);
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_ROTL)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 uint32 a, b;
 
                 b = (uint32)frame_lp[GET_OFFSET()];
                 a = (uint32)frame_lp[GET_OFFSET()];
                 frame_lp[GET_OFFSET()] = rotl32(a, b);
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_ROTR)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 uint32 a, b;
 
                 b = (uint32)frame_lp[GET_OFFSET()];
                 a = (uint32)frame_lp[GET_OFFSET()];
                 frame_lp[GET_OFFSET()] = rotr32(a, b);
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             /* numeric instructions of i64 */
@@ -4550,20 +4615,26 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_I64_ADD)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_NUMERIC_64(uint64, uint64, I64, +);
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_SUB)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_NUMERIC_64(uint64, uint64, I64, -);
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_MUL)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_NUMERIC_64(uint64, uint64, I64, *);
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_DIV_S)
@@ -4632,58 +4703,74 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_I64_AND)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_NUMERIC_64(uint64, uint64, I64, &);
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_OR)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_NUMERIC_64(uint64, uint64, I64, |);
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_XOR)
             {
+                TRUIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_NUMERIC_64(uint64, uint64, I64, ^);
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_SHL)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_NUMERIC2_64(uint64, uint64, I64, <<);
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_SHR_S)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_NUMERIC2_64(int64, uint64, I64, >>);
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();   
             }
 
             HANDLE_OP(WASM_OP_I64_SHR_U)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_NUMERIC2_64(uint64, uint64, I64, >>);
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_ROTL)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 uint64 a, b;
 
                 b = GET_I64_FROM_ADDR(frame_lp + GET_OFFSET());
                 a = GET_I64_FROM_ADDR(frame_lp + GET_OFFSET());
                 PUT_I64_TO_ADDR(frame_lp + GET_OFFSET(), rotl64(a, b));
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_ROTR)
             {
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 uint64 a, b;
 
                 b = GET_I64_FROM_ADDR(frame_lp + GET_OFFSET());
                 a = GET_I64_FROM_ADDR(frame_lp + GET_OFFSET());
                 PUT_I64_TO_ADDR(frame_lp + GET_OFFSET(), rotr64(a, b));
-                HANDLE_OP_END();
+                // HANDLE_OP_END();
+                ACCELERATED_OP_END();
             }
 
             /* numeric instructions of f32 */
