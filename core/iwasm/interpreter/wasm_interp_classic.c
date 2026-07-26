@@ -33,9 +33,37 @@ typedef int64 CellType_I64;
 typedef float32 CellType_F32;
 typedef float64 CellType_F64;
 
+#define ENABLE_DISPATCH_TRACE 0
+#define ENABLE_ACCELERATOR_TRACE 0
+
+#if ENABLE_DISPATCH_TRACE != 0
+static uint32 dispatch_id = 0;
+#define DISPATCH_TRACE_LIMIT 512
+
+static __attribute__((noinline)) void
+trace_dispatch(uint32 id, uint8 op, uint8 *ip, uint8 *meta, uint32 *sp,
+               uint32 *sp_bottom)
+{
+    uint32 top0 = 0, top1 = 0;
+
+    if (id > DISPATCH_TRACE_LIMIT)
+        return;
+
+    if (sp && sp_bottom) {
+        if (sp > sp_bottom)
+            top0 = sp[-1];
+        if (sp > sp_bottom + 1)
+            top1 = sp[-2];
+    }
+
+    printf("D %u %x %x %x %x %x %x\n", id, op, (uint32)(uintptr_t)ip,
+           (uint32)(uintptr_t)meta, (uint32)(uintptr_t)sp, top0, top1);
+}
+#endif
+
 #define USE_ACCELERATOR
 
-#ifdef USE_ACCELERATOR
+
     /* Hardware accelerator CSR definitions */
     #define CSR_HANDLER_TBL 0x7C4
     #define CSR_FRAME_IP    0x7C1 
@@ -44,42 +72,83 @@ typedef float64 CellType_F64;
     #define CSR_ACC_BUSY    0x7C5
     #define CSR_HANDLER     0x7C2
     #define WASM_JUMP_INST 0x0000007b
+#ifdef USE_ACCELERATOR
 
-
-    #define TRIGGER_ACCELERATOR(fip, inc) do { \
+    #define TRIGGER_MEM_ACCELERATOR(fip, inc) do {                                      \
+        if (ENABLE_ACCELERATOR_TRACE) {                                                 \
+        if (accel_dbg_count < 32) {                                                     \
+            accel_dbg_count++;                                                          \
+            uint32_t sw_frame_ip = (uint32_t)(uintptr_t)(fip);                          \
+            uint8_t sw_opcode = *(uint8_t *)(uintptr_t)sw_frame_ip;                     \
+            uint32_t sw_handler = (uint32_t)(uintptr_t)handle_table[sw_opcode];         \
+        printf("[SW-DISP %u] frame_ip=0x%x opcode=0x%x handler=0x%x\n",           \
+               accel_dbg_count, sw_frame_ip, sw_opcode, sw_handler);                    \
+        }                                                                               \
+    }                                                                                   \
         asm volatile("csrw %0, %1" :: "i"(CSR_FRAME_IP), "r"((uint32_t)(uintptr_t)(fip))); \
         asm volatile("csrw %0, %1" :: "i"(CSR_INC),      "r"((uint32_t)(inc)));             \
     } while(0)
 
-    #define HANDLE_OP_END_ACCELERATED()                                       \
-        do {                                                                   \
-            frame_ip = (uint8 *)(uintptr_t)({                                 \
-                uint32_t _v;                                                   \
-                asm volatile("csrr %0, %1" : "=r"(_v) : "i"(CSR_FRAME_IP));  \
-                _v;                                                            \
-            });                                                                \
-            asm volatile(".word %0" :: "i"(WASM_JUMP_INST));                  \
-        } while (0)
+    #define TRIGGER_ACCELERATOR(fip, inc) (void)0
 
-    #define OPCODE_LABEL(op) HANDLE_CLASSIC_##op:
+#if ENABLE_DISPATCH_TRACE != 0
+    #define ACCELERATED_OP_END()                                             \
+        do {                                                                 \
+            uint8 *dbg_ip = frame_ip;                                        \
+            uint8 dbg_op = *dbg_ip;                                          \
+            uint32_t dbg_next_ip;                                            \
+            asm volatile("csrr %0, %1" : "=r"(dbg_next_ip)                  \
+                         : "i"(CSR_FRAME_IP) : "memory");                   \
+            dispatch_id++;                                                   \
+            frame_ip = (uint8 *)(uintptr_t)dbg_next_ip;                      \
+                     trace_dispatch(dispatch_id, dbg_op, dbg_ip, frame_ip, frame_sp,  \
+                              frame ? frame->sp_bottom : NULL);                \
+            asm volatile(".word %0" :: "i"(WASM_JUMP_INST) : "memory");     \
+        } while (0)
 #else
-    #define TRIGGER_ACCELERATOR(fip, inc) 
-    #define HANDLE_OP_END_ACCELERATED() HANDLE_OP_END()
-    #define OPCODE_LABEL(op) 
+    #define ACCELERATED_OP_END()                                             \
+        do {                                                                 \
+            uint32_t dbg_next_ip;                                            \
+            asm volatile("csrr %0, %1" : "=r"(dbg_next_ip)                  \
+                         : "i"(CSR_FRAME_IP) : "memory");                   \
+            frame_ip = (uint8 *)(uintptr_t)dbg_next_ip;                      \
+            asm volatile(".word %0" :: "i"(WASM_JUMP_INST) : "memory");     \
+        } while (0)
 #endif
 
+    // #define ACCELERATED_OP_END()                                       \
+    //     do {                                                                   \
+    //         frame_ip +=1;                                                       \
+    //         asm volatile(".word %0" :: "i"(WASM_JUMP_INST));                  \
+    //     } while (0)
 
 
+    // #define ACCELERATED_OP_END()                                           \
+    //     do {                                                               \
+    //         uint32_t busy;                                                 \
+    //         uint32_t next_ip;                                              \
+    //         uint32_t handler;                                              \
+    //         do {                                                           \
+    //             asm volatile("csrr %0, %1" : "=r"(busy) : "i"(CSR_ACC_BUSY)); \
+    //         } while (busy);                                                \
+    //         asm volatile("csrr %0, %1" : "=r"(next_ip) : "i"(CSR_FRAME_IP)); \
+    //         asm volatile("csrr %0, %1" : "=r"(handler) : "i"(CSR_HANDLER));  \
+    //         frame_ip = (uint8 *)(uintptr_t)next_ip;                        \
+    //         goto *(void *)(uintptr_t)handler;                              \
+    //     } while (0)
+#else
+    #define TRIGGER_ACCELERATOR(fip, inc) 
+    #define ACCELERATED_OP_END() HANDLE_OP_END()
+#endif
 
-static void *classic_handler_table[256];
-
-void wasm_accelerator_init(void) {
+    void wasm_accelerator_init(void) {
     /* Config=0 for classic mode */
     uint32_t config = 0x0;
     asm volatile("csrw %0, %1" :: "i"(CSR_CONFIG), "r"(config));
     /* Table registration deferred to first call of wasm_interp_call_func_bytecode
      * once label addresses are available (done via classic_handler_table_init flag) */
 }
+
 
 
 
@@ -96,6 +165,26 @@ void wasm_accelerator_init(void) {
 #define get_linear_mem_size() GET_LINEAR_MEMORY_SIZE(memory)
 #endif
 
+#ifdef USE_ACCELERATOR
+    uint32_t oob_dbg_addr = 0;
+    uint32_t oob_dbg_offset = 0;
+    uint32_t oob_dbg_bytes = 0;
+    uint8 *oob_dbg_frame_ip = NULL;
+    uint32 *oob_dbg_frame_sp = NULL;
+    uint32_t oob_dbg_opcode = 0;
+#define RECORD_OOB_DEBUG(bytes)               \
+    do {                                      \
+        oob_dbg_addr = (uint32_t)addr;        \
+        oob_dbg_offset = (uint32_t)offset;    \
+        oob_dbg_bytes = (uint32_t)(bytes);    \
+        oob_dbg_frame_ip = frame_ip;          \
+        oob_dbg_frame_sp = frame_sp;          \
+        oob_dbg_opcode = (uint32_t)opcode;    \
+    } while (0)
+#else
+#define RECORD_OOB_DEBUG(bytes) (void)0
+#endif
+
 #if WASM_ENABLE_MEMORY64 == 0
 
 #if (!defined(OS_ENABLE_HW_BOUND_CHECK) \
@@ -108,8 +197,10 @@ void wasm_accelerator_init(void) {
             /* If offset1 is in valid range, maddr must also                   \
                be in valid range, no need to check it again. */                \
             maddr = memory->memory_data + offset1;                             \
-        else                                                                   \
+        else {                                                                  \
+            RECORD_OOB_DEBUG(bytes);                                            \
             goto out_of_bounds;                                                \
+        }                                    \
     } while (0)
 
 #define CHECK_BULK_MEMORY_OVERFLOW(start, bytes, maddr)                        \
@@ -1520,10 +1611,73 @@ wasm_interp_call_func_import(WASMModuleInstance *module_inst,
 #endif
 #endif
 
+#ifdef USE_ACCELERATOR
+    static uint32_t accel_dbg_count = 0;
+    static uint32_t mem_dbg_count = 0;
+    static uint32_t store_dbg_count = 0;
+
+    #define MEM_DBG_LIMIT 64
+    #define STORE_DBG_LIMIT 128
+
+    #define TRACE_LOAD_ACCESS(bytes)                                                   \
+        do {                                                                            \
+            uint64 dbg_eff = (uint64)offset + (uint64)addr;                             \
+            uint64 dbg_end = dbg_eff + (uint64)(bytes);                                 \
+            if (dbg_end > get_linear_mem_size()) {                                      \
+                printf("[MEM-BAD] ip=%p op=0x%x addr=0x%x off=0x%x end=0x%x size=0x%x sp=%p\n", \
+                       frame_ip, cur_op, (uint32)addr, (uint32)offset,                  \
+                       (uint32)dbg_end, (uint32)get_linear_mem_size(), frame_sp);       \
+            }                                                                           \
+            else if (mem_dbg_count < MEM_DBG_LIMIT                                      \
+                     && (((uint32)offset == 0x800)                                      \
+                         || ((uint32)(uintptr_t)frame_ip == 0x10004077)                 \
+                         || ((uint32)(uintptr_t)frame_ip == 0x100040D9))) {             \
+                mem_dbg_count++;                                                        \
+                printf("[LOAD] ip=%p op=0x%x addr=0x%x off=0x%x end=0x%x sp=%p\n",     \
+                       frame_ip, cur_op, (uint32)addr, (uint32)offset,                  \
+                       (uint32)dbg_end, frame_sp);                                      \
+            }                                                                           \
+        } while (0)
+
+    #define TRACE_STORE_ACCESS(bytes, value)                                            \
+        do {                                                                            \
+            uint64 dbg_eff = (uint64)offset + (uint64)addr;                             \
+            uint64 dbg_end = dbg_eff + (uint64)(bytes);                                 \
+            if (dbg_end > get_linear_mem_size()) {                                      \
+                printf("[MEM-BAD] ip=%p op=0x%x addr=0x%x off=0x%x end=0x%x size=0x%x val=0x%x sp=%p\n", \
+                       frame_ip, cur_op, (uint32)addr, (uint32)offset,                  \
+                       (uint32)dbg_end, (uint32)get_linear_mem_size(),                  \
+                       (uint32)(value), frame_sp);                                      \
+            }                                                                           \
+            else if (store_dbg_count < STORE_DBG_LIMIT                                  \
+                     && (((uint32)offset == 0x800)                                      \
+                         || ((uint32)(uintptr_t)frame_ip == 0x100040F5))) {             \
+                store_dbg_count++;                                                      \
+                printf("[STORE] ip=%p op=0x%x addr=0x%x off=0x%x end=0x%x val=0x%x sp=%p\n", \
+                       frame_ip, cur_op, (uint32)addr, (uint32)offset,                  \
+                       (uint32)dbg_end, (uint32)(value), frame_sp);                     \
+            }                                                                           \
+        } while (0)
+#else
+    #define TRACE_LOAD_ACCESS(bytes) (void)0
+    #define TRACE_STORE_ACCESS(bytes, value) (void)0
+#endif
+
 #if WASM_ENABLE_LABELS_AS_VALUES != 0
 
 #define HANDLE_OP(opcode) HANDLE_##opcode:
+#if ENABLE_DISPATCH_TRACE != 0
+#define FETCH_OPCODE_AND_DISPATCH()                                      \
+    do {                                                                 \
+        opcode = *frame_ip++;                                            \
+        dispatch_id++;                                                   \
+        trace_dispatch(dispatch_id, opcode, frame_ip - 1, frame_ip,       \
+                       frame_sp, frame ? frame->sp_bottom : NULL);        \
+        goto *handle_table[opcode];                                      \
+    } while (0)
+#else
 #define FETCH_OPCODE_AND_DISPATCH() goto *handle_table[*frame_ip++]
+#endif
 
 #if WASM_ENABLE_THREAD_MGR != 0 && WASM_ENABLE_DEBUG_INTERP != 0
 #define HANDLE_OP_END()                                                       \
@@ -1614,6 +1768,15 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                                WASMFunctionInstance *cur_func,
                                WASMInterpFrame *prev_frame)
 {
+
+    #ifdef USE_ACCELERATOR
+    uint32_t oob_dbg_addr = 0;
+    uint32_t oob_dbg_offset = 0;
+    uint32_t oob_dbg_bytes = 0;
+    uint32_t oob_dbg_opcode = 0;
+    uint8 *oob_dbg_frame_ip = NULL;
+    uint32 *oob_dbg_frame_sp = NULL;
+#endif
     WASMMemoryInstance *memory = wasm_get_default_memory(module);
 #if !defined(OS_ENABLE_HW_BOUND_CHECK)              \
     || WASM_CPU_SUPPORTS_UNALIGNED_ADDR_ACCESS == 0 \
@@ -1719,249 +1882,23 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 #define HANDLE_OPCODE(op) &&HANDLE_##op
     DEFINE_GOTO_TABLE(const void *, handle_table);
 #undef HANDLE_OPCODE
+
+
+#ifdef USE_ACCELERATOR
+    static int accelerator_initialized = 0;
+    if (!accelerator_initialized) {
+        wasm_accelerator_init();          // ← sets CSR_CONFIG=0 for classic mode
+        accelerator_initialized = 1;
+    }
+    uint32_t tbl_addr = (uint32_t)(uintptr_t)&handle_table[0];
+    asm volatile("csrw %0, %1" :: "i"(CSR_HANDLER_TBL), "r"(tbl_addr));
 #endif
 
-#if WASM_ENABLE_LABELS_AS_VALUES == 0
-#ifdef USE_ACCELERATOR
-    // Initialize classic_handler_table once with label addresses.
-    // Accelerated opcodes point to their OPCODE_LABEL inside the case block.
-    static int classic_handler_table_initialized = 0;
-    if (!classic_handler_table_initialized) {
-        for (int _i = 0; _i < 256; _i++)
-            classic_handler_table[_i] = &&classic_dispatch_label;
+#endif
 
-        classic_handler_table[WASM_OP_UNREACHABLE]           = &&HANDLE_CLASSIC_WASM_OP_UNREACHABLE; /* 0x00 */
-        classic_handler_table[WASM_OP_NOP]                   = &&HANDLE_CLASSIC_WASM_OP_NOP; /* 0x01 */
-        classic_handler_table[WASM_OP_BLOCK]                 = &&HANDLE_CLASSIC_WASM_OP_BLOCK; /* 0x02 */
-        classic_handler_table[WASM_OP_LOOP]                  = &&HANDLE_CLASSIC_WASM_OP_LOOP; /* 0x03 */
-        classic_handler_table[WASM_OP_IF]                    = &&HANDLE_CLASSIC_WASM_OP_IF; /* 0x04 */
-        classic_handler_table[WASM_OP_ELSE]                  = &&HANDLE_CLASSIC_WASM_OP_ELSE; /* 0x05 */
-        classic_handler_table[WASM_OP_TRY]                   = &&HANDLE_CLASSIC_WASM_OP_TRY; /* 0x06 */
-        classic_handler_table[WASM_OP_CATCH]                 = &&HANDLE_CLASSIC_WASM_OP_CATCH; /* 0x07 */
-        classic_handler_table[WASM_OP_THROW]                 = &&HANDLE_CLASSIC_WASM_OP_THROW; /* 0x08 */
-        classic_handler_table[WASM_OP_RETHROW]               = &&HANDLE_CLASSIC_WASM_OP_RETHROW; /* 0x09 */
-        classic_handler_table[WASM_OP_UNUSED_0x0a]           = &&classic_dispatch_label; /* 0x0a */
-        classic_handler_table[WASM_OP_END]                   = &&HANDLE_CLASSIC_WASM_OP_END; /* 0x0b */
-        classic_handler_table[WASM_OP_BR]                    = &&HANDLE_CLASSIC_WASM_OP_BR; /* 0x0c */
-        classic_handler_table[WASM_OP_BR_IF]                 = &&HANDLE_CLASSIC_WASM_OP_BR_IF; /* 0x0d */
-        classic_handler_table[WASM_OP_BR_TABLE]              = &&HANDLE_CLASSIC_WASM_OP_BR_TABLE; /* 0x0e */
-        classic_handler_table[WASM_OP_RETURN]                = &&HANDLE_CLASSIC_WASM_OP_RETURN; /* 0x0f */
-        classic_handler_table[WASM_OP_CALL]                  = &&HANDLE_CLASSIC_WASM_OP_CALL; /* 0x10 */
-        classic_handler_table[WASM_OP_CALL_INDIRECT]         = &&HANDLE_CLASSIC_WASM_OP_RETURN_CALL_INDIRECT; /* 0x11 */
-        classic_handler_table[WASM_OP_RETURN_CALL]           = &&HANDLE_CLASSIC_WASM_OP_RETURN_CALL; /* 0x12 */
-        classic_handler_table[WASM_OP_RETURN_CALL_INDIRECT]  = &&HANDLE_CLASSIC_WASM_OP_RETURN_CALL_INDIRECT; /* 0x13 */
-        classic_handler_table[WASM_OP_CALL_REF]              = &&HANDLE_CLASSIC_WASM_OP_CALL_REF; /* 0x14 */
-        classic_handler_table[WASM_OP_RETURN_CALL_REF]       = &&HANDLE_CLASSIC_WASM_OP_RETURN_CALL_REF; /* 0x15 */
-        classic_handler_table[WASM_OP_UNUSED_0x16]           = &&classic_dispatch_label; /* 0x16 */
-        classic_handler_table[WASM_OP_UNUSED_0x17]           = &&classic_dispatch_label; /* 0x17 */
-        classic_handler_table[WASM_OP_DELEGATE]              = &&HANDLE_CLASSIC_WASM_OP_DELEGATE; /* 0x18 */
-        classic_handler_table[WASM_OP_CATCH_ALL]             = &&HANDLE_CLASSIC_WASM_OP_CATCH_ALL; /* 0x19 */
-        classic_handler_table[WASM_OP_DROP]                  = &&HANDLE_CLASSIC_WASM_OP_DROP; /* 0x1a */
-        classic_handler_table[WASM_OP_SELECT]                = &&HANDLE_CLASSIC_WASM_OP_SELECT; /* 0x1b */
-        classic_handler_table[WASM_OP_SELECT_T]              = &&HANDLE_CLASSIC_WASM_OP_SELECT_T; /* 0x1c */
-        classic_handler_table[WASM_OP_GET_GLOBAL_64]         = &&HANDLE_CLASSIC_WASM_OP_GET_GLOBAL_64; /* 0x1d */
-        classic_handler_table[WASM_OP_SET_GLOBAL_64]         = &&HANDLE_CLASSIC_WASM_OP_SET_GLOBAL_64; /* 0x1e */
-        classic_handler_table[WASM_OP_SET_GLOBAL_AUX_STACK]  = &&HANDLE_CLASSIC_WASM_OP_SET_GLOBAL_AUX_STACK; /* 0x1f */
-        classic_handler_table[WASM_OP_GET_LOCAL]             = &&HANDLE_CLASSIC_WASM_OP_GET_LOCAL; /* 0x20 */
-        classic_handler_table[WASM_OP_SET_LOCAL]             = &&HANDLE_CLASSIC_WASM_OP_SET_LOCAL; /* 0x21 */
-        classic_handler_table[WASM_OP_TEE_LOCAL]             = &&HANDLE_CLASSIC_WASM_OP_TEE_LOCAL; /* 0x22 */
-        classic_handler_table[WASM_OP_GET_GLOBAL]            = &&HANDLE_CLASSIC_WASM_OP_GET_GLOBAL; /* 0x23 */
-        classic_handler_table[WASM_OP_SET_GLOBAL]            = &&HANDLE_CLASSIC_WASM_OP_SET_GLOBAL; /* 0x24 */
-        classic_handler_table[WASM_OP_TABLE_GET]             = &&HANDLE_CLASSIC_WASM_OP_TABLE_GET; /* 0x25 */
-        classic_handler_table[WASM_OP_TABLE_SET]             = &&HANDLE_CLASSIC_WASM_OP_TABLE_SET; /* 0x26 */
-        classic_handler_table[WASM_OP_UNUSED_0x27]           = &&classic_dispatch_label; /* 0x27 */
-        classic_handler_table[WASM_OP_I32_LOAD]              = &&HANDLE_CLASSIC_WASM_OP_F32_LOAD;  /* 0x28 ACCEL */
-        classic_handler_table[WASM_OP_I64_LOAD]              = &&HANDLE_CLASSIC_WASM_OP_F64_LOAD;  /* 0x29 ACCEL */
-        classic_handler_table[WASM_OP_F32_LOAD]              = &&HANDLE_CLASSIC_WASM_OP_F32_LOAD; /* 0x2a */
-        classic_handler_table[WASM_OP_F64_LOAD]              = &&HANDLE_CLASSIC_WASM_OP_F64_LOAD; /* 0x2b */
-        classic_handler_table[WASM_OP_I32_LOAD8_S]           = &&HANDLE_CLASSIC_WASM_OP_I32_LOAD8_S; /* 0x2c */
-        classic_handler_table[WASM_OP_I32_LOAD8_U]           = &&HANDLE_CLASSIC_WASM_OP_I32_LOAD8_U; /* 0x2d */
-        classic_handler_table[WASM_OP_I32_LOAD16_S]          = &&HANDLE_CLASSIC_WASM_OP_I32_LOAD16_S; /* 0x2e */
-        classic_handler_table[WASM_OP_I32_LOAD16_U]          = &&HANDLE_CLASSIC_WASM_OP_I32_LOAD16_U; /* 0x2f */
-        classic_handler_table[WASM_OP_I64_LOAD8_S]           = &&HANDLE_CLASSIC_WASM_OP_I64_LOAD8_S; /* 0x30 */
-        classic_handler_table[WASM_OP_I64_LOAD8_U]           = &&HANDLE_CLASSIC_WASM_OP_I64_LOAD8_U; /* 0x31 */
-        classic_handler_table[WASM_OP_I64_LOAD16_S]          = &&HANDLE_CLASSIC_WASM_OP_I64_LOAD16_S; /* 0x32 */
-        classic_handler_table[WASM_OP_I64_LOAD16_U]          = &&HANDLE_CLASSIC_WASM_OP_I64_LOAD16_U; /* 0x33 */
-        classic_handler_table[WASM_OP_I64_LOAD32_S]          = &&HANDLE_CLASSIC_WASM_OP_I64_LOAD32_S; /* 0x34 */
-        classic_handler_table[WASM_OP_I64_LOAD32_U]          = &&HANDLE_CLASSIC_WASM_OP_I64_LOAD32_U; /* 0x35 */
-        classic_handler_table[WASM_OP_I32_STORE]             = &&HANDLE_CLASSIC_WASM_OP_F32_STORE; /* 0x36 */
-        classic_handler_table[WASM_OP_I64_STORE]             = &&HANDLE_CLASSIC_WASM_OP_F64_STORE; /* 0x37 */
-        classic_handler_table[WASM_OP_F32_STORE]             = &&HANDLE_CLASSIC_WASM_OP_F32_STORE; /* 0x38 */
-        classic_handler_table[WASM_OP_F64_STORE]             = &&HANDLE_CLASSIC_WASM_OP_F64_STORE; /* 0x39 */
-        classic_handler_table[WASM_OP_I32_STORE8]            = &&HANDLE_CLASSIC_WASM_OP_I32_STORE16; /* 0x3a */
-        classic_handler_table[WASM_OP_I32_STORE16]           = &&HANDLE_CLASSIC_WASM_OP_I32_STORE16; /* 0x3b */
-        classic_handler_table[WASM_OP_I64_STORE8]            = &&HANDLE_CLASSIC_WASM_OP_I64_STORE32; /* 0x3c */
-        classic_handler_table[WASM_OP_I64_STORE16]           = &&HANDLE_CLASSIC_WASM_OP_I64_STORE32; /* 0x3d */
-        classic_handler_table[WASM_OP_I64_STORE32]           = &&HANDLE_CLASSIC_WASM_OP_I64_STORE32; /* 0x3e */
-        classic_handler_table[WASM_OP_MEMORY_SIZE]           = &&HANDLE_CLASSIC_WASM_OP_MEMORY_SIZE; /* 0x3f */
-        classic_handler_table[WASM_OP_MEMORY_GROW]           = &&HANDLE_CLASSIC_WASM_OP_MEMORY_GROW; /* 0x40 */
-        classic_handler_table[WASM_OP_I32_CONST]             = &&HANDLE_CLASSIC_WASM_OP_I32_CONST; /* 0x41 */
-        classic_handler_table[WASM_OP_I64_CONST]             = &&HANDLE_CLASSIC_WASM_OP_I64_CONST; /* 0x42 */
-        classic_handler_table[WASM_OP_F32_CONST]             = &&HANDLE_CLASSIC_WASM_OP_F32_CONST; /* 0x43 */
-        classic_handler_table[WASM_OP_F64_CONST]             = &&HANDLE_CLASSIC_WASM_OP_F64_CONST; /* 0x44 */
-        classic_handler_table[WASM_OP_I32_EQZ]               = &&HANDLE_CLASSIC_WASM_OP_I32_EQZ;   /* 0x45 ACCEL */
-        classic_handler_table[WASM_OP_I32_EQ]                = &&HANDLE_CLASSIC_WASM_OP_I32_EQ;    /* 0x46 ACCEL */
-        classic_handler_table[WASM_OP_I32_NE]                = &&HANDLE_CLASSIC_WASM_OP_I32_NE;    /* 0x47 ACCEL */
-        classic_handler_table[WASM_OP_I32_LT_S]              = &&HANDLE_CLASSIC_WASM_OP_I32_LT_S;  /* 0x48 ACCEL */
-        classic_handler_table[WASM_OP_I32_LT_U]              = &&HANDLE_CLASSIC_WASM_OP_I32_LT_U;  /* 0x49 ACCEL */
-        classic_handler_table[WASM_OP_I32_GT_S]              = &&HANDLE_CLASSIC_WASM_OP_I32_GT_S;  /* 0x4a ACCEL */
-        classic_handler_table[WASM_OP_I32_GT_U]              = &&HANDLE_CLASSIC_WASM_OP_I32_GT_U;  /* 0x4b ACCEL */
-        classic_handler_table[WASM_OP_I32_LE_S]              = &&HANDLE_CLASSIC_WASM_OP_I32_LE_S;  /* 0x4c ACCEL */
-        classic_handler_table[WASM_OP_I32_LE_U]              = &&HANDLE_CLASSIC_WASM_OP_I32_LE_U;  /* 0x4d ACCEL */
-        classic_handler_table[WASM_OP_I32_GE_S]              = &&HANDLE_CLASSIC_WASM_OP_I32_GE_S;  /* 0x4e ACCEL */
-        classic_handler_table[WASM_OP_I32_GE_U]              = &&HANDLE_CLASSIC_WASM_OP_I32_GE_U;  /* 0x4f ACCEL */
-        classic_handler_table[WASM_OP_I64_EQZ]               = &&HANDLE_CLASSIC_WASM_OP_I64_EQZ;   /* 0x50 ACCEL */
-        classic_handler_table[WASM_OP_I64_EQ]                = &&HANDLE_CLASSIC_WASM_OP_I64_EQ;    /* 0x51 ACCEL */
-        classic_handler_table[WASM_OP_I64_NE]                = &&HANDLE_CLASSIC_WASM_OP_I64_NE;    /* 0x52 ACCEL */
-        classic_handler_table[WASM_OP_I64_LT_S]              = &&HANDLE_CLASSIC_WASM_OP_I64_LT_S;  /* 0x53 ACCEL */
-        classic_handler_table[WASM_OP_I64_LT_U]              = &&HANDLE_CLASSIC_WASM_OP_I64_LT_U;  /* 0x54 ACCEL */
-        classic_handler_table[WASM_OP_I64_GT_S]              = &&HANDLE_CLASSIC_WASM_OP_I64_GT_S;  /* 0x55 ACCEL */
-        classic_handler_table[WASM_OP_I64_GT_U]              = &&HANDLE_CLASSIC_WASM_OP_I64_GT_U;  /* 0x56 ACCEL */
-        classic_handler_table[WASM_OP_I64_LE_S]              = &&HANDLE_CLASSIC_WASM_OP_I64_LE_S;  /* 0x57 ACCEL */
-        classic_handler_table[WASM_OP_I64_LE_U]              = &&HANDLE_CLASSIC_WASM_OP_I64_LE_U;  /* 0x58 ACCEL */
-        classic_handler_table[WASM_OP_I64_GE_S]              = &&HANDLE_CLASSIC_WASM_OP_I64_GE_S;  /* 0x59 ACCEL */
-        classic_handler_table[WASM_OP_I64_GE_U]              = &&HANDLE_CLASSIC_WASM_OP_I64_GE_U;  /* 0x5a ACCEL */
-        classic_handler_table[WASM_OP_F32_EQ]                = &&HANDLE_CLASSIC_WASM_OP_F32_EQ; /* 0x5b */
-        classic_handler_table[WASM_OP_F32_NE]                = &&HANDLE_CLASSIC_WASM_OP_F32_NE; /* 0x5c */
-        classic_handler_table[WASM_OP_F32_LT]                = &&HANDLE_CLASSIC_WASM_OP_F32_LT; /* 0x5d */
-        classic_handler_table[WASM_OP_F32_GT]                = &&HANDLE_CLASSIC_WASM_OP_F32_GT; /* 0x5e */
-        classic_handler_table[WASM_OP_F32_LE]                = &&HANDLE_CLASSIC_WASM_OP_F32_LE; /* 0x5f */
-        classic_handler_table[WASM_OP_F32_GE]                = &&HANDLE_CLASSIC_WASM_OP_F32_GE; /* 0x60 */
-        classic_handler_table[WASM_OP_F64_EQ]                = &&HANDLE_CLASSIC_WASM_OP_F64_EQ; /* 0x61 */
-        classic_handler_table[WASM_OP_F64_NE]                = &&HANDLE_CLASSIC_WASM_OP_F64_NE; /* 0x62 */
-        classic_handler_table[WASM_OP_F64_LT]                = &&HANDLE_CLASSIC_WASM_OP_F64_LT; /* 0x63 */
-        classic_handler_table[WASM_OP_F64_GT]                = &&HANDLE_CLASSIC_WASM_OP_F64_GT; /* 0x64 */
-        classic_handler_table[WASM_OP_F64_LE]                = &&HANDLE_CLASSIC_WASM_OP_F64_LE; /* 0x65 */
-        classic_handler_table[WASM_OP_F64_GE]                = &&HANDLE_CLASSIC_WASM_OP_F64_GE; /* 0x66 */
-        classic_handler_table[WASM_OP_I32_CLZ]               = &&HANDLE_CLASSIC_WASM_OP_I32_CLZ; /* 0x67 */
-        classic_handler_table[WASM_OP_I32_CTZ]               = &&HANDLE_CLASSIC_WASM_OP_I32_CTZ; /* 0x68 */
-        classic_handler_table[WASM_OP_I32_POPCNT]            = &&HANDLE_CLASSIC_WASM_OP_I32_POPCNT; /* 0x69 */
-        classic_handler_table[WASM_OP_I32_ADD]               = &&HANDLE_CLASSIC_WASM_OP_I32_ADD;   /* 0x6a ACCEL */
-        classic_handler_table[WASM_OP_I32_SUB]               = &&HANDLE_CLASSIC_WASM_OP_I32_SUB;   /* 0x6b ACCEL */
-        classic_handler_table[WASM_OP_I32_MUL]               = &&HANDLE_CLASSIC_WASM_OP_I32_MUL;   /* 0x6c ACCEL */
-        classic_handler_table[WASM_OP_I32_DIV_S]             = &&HANDLE_CLASSIC_WASM_OP_I32_DIV_S; /* 0x6d */
-        classic_handler_table[WASM_OP_I32_DIV_U]             = &&HANDLE_CLASSIC_WASM_OP_I32_DIV_U; /* 0x6e */
-        classic_handler_table[WASM_OP_I32_REM_S]             = &&HANDLE_CLASSIC_WASM_OP_I32_REM_S; /* 0x6f */
-        classic_handler_table[WASM_OP_I32_REM_U]             = &&HANDLE_CLASSIC_WASM_OP_I32_REM_U; /* 0x70 */
-        classic_handler_table[WASM_OP_I32_AND]               = &&HANDLE_CLASSIC_WASM_OP_I32_AND;   /* 0x71 ACCEL */
-        classic_handler_table[WASM_OP_I32_OR]                = &&HANDLE_CLASSIC_WASM_OP_I32_OR;    /* 0x72 ACCEL */
-        classic_handler_table[WASM_OP_I32_XOR]               = &&HANDLE_CLASSIC_WASM_OP_I32_XOR;   /* 0x73 ACCEL */
-        classic_handler_table[WASM_OP_I32_SHL]               = &&HANDLE_CLASSIC_WASM_OP_I32_SHL;   /* 0x74 ACCEL */
-        classic_handler_table[WASM_OP_I32_SHR_S]             = &&HANDLE_CLASSIC_WASM_OP_I32_SHR_S; /* 0x75 ACCEL */
-        classic_handler_table[WASM_OP_I32_SHR_U]             = &&HANDLE_CLASSIC_WASM_OP_I32_SHR_U; /* 0x76 ACCEL */
-        classic_handler_table[WASM_OP_I32_ROTL]              = &&HANDLE_CLASSIC_WASM_OP_I32_ROTL; /* 0x77 */
-        classic_handler_table[WASM_OP_I32_ROTR]              = &&HANDLE_CLASSIC_WASM_OP_I32_ROTR; /* 0x78 */
-        classic_handler_table[WASM_OP_I64_CLZ]               = &&HANDLE_CLASSIC_WASM_OP_I64_CLZ; /* 0x79 */
-        classic_handler_table[WASM_OP_I64_CTZ]               = &&HANDLE_CLASSIC_WASM_OP_I64_CTZ; /* 0x7a */
-        classic_handler_table[WASM_OP_I64_POPCNT]            = &&HANDLE_CLASSIC_WASM_OP_I64_POPCNT; /* 0x7b */
-        classic_handler_table[WASM_OP_I64_ADD]               = &&HANDLE_CLASSIC_WASM_OP_I64_ADD;   /* 0x7c ACCEL */
-        classic_handler_table[WASM_OP_I64_SUB]               = &&HANDLE_CLASSIC_WASM_OP_I64_SUB;   /* 0x7d ACCEL */
-        classic_handler_table[WASM_OP_I64_MUL]               = &&HANDLE_CLASSIC_WASM_OP_I64_MUL;   /* 0x7e ACCEL */
-        classic_handler_table[WASM_OP_I64_DIV_S]             = &&HANDLE_CLASSIC_WASM_OP_I64_DIV_S; /* 0x7f */
-        classic_handler_table[WASM_OP_I64_DIV_U]             = &&HANDLE_CLASSIC_WASM_OP_I64_DIV_U; /* 0x80 */
-        classic_handler_table[WASM_OP_I64_REM_S]             = &&HANDLE_CLASSIC_WASM_OP_I64_REM_S; /* 0x81 */
-        classic_handler_table[WASM_OP_I64_REM_U]             = &&HANDLE_CLASSIC_WASM_OP_I64_REM_U; /* 0x82 */
-        classic_handler_table[WASM_OP_I64_AND]               = &&HANDLE_CLASSIC_WASM_OP_I64_AND;   /* 0x83 ACCEL */
-        classic_handler_table[WASM_OP_I64_OR]                = &&HANDLE_CLASSIC_WASM_OP_I64_OR;    /* 0x84 ACCEL */
-        classic_handler_table[WASM_OP_I64_XOR]               = &&HANDLE_CLASSIC_WASM_OP_I64_XOR;   /* 0x85 ACCEL */
-        classic_handler_table[WASM_OP_I64_SHL]               = &&HANDLE_CLASSIC_WASM_OP_I64_SHL;   /* 0x86 ACCEL */
-        classic_handler_table[WASM_OP_I64_SHR_S]             = &&HANDLE_CLASSIC_WASM_OP_I64_SHR_S; /* 0x87 ACCEL */
-        classic_handler_table[WASM_OP_I64_SHR_U]             = &&HANDLE_CLASSIC_WASM_OP_I64_SHR_U; /* 0x88 ACCEL */
-        classic_handler_table[WASM_OP_I64_ROTL]              = &&HANDLE_CLASSIC_WASM_OP_I64_ROTL; /* 0x89 */
-        classic_handler_table[WASM_OP_I64_ROTR]              = &&HANDLE_CLASSIC_WASM_OP_I64_ROTR; /* 0x8a */
-        classic_handler_table[WASM_OP_F32_ABS]               = &&HANDLE_CLASSIC_WASM_OP_F32_ABS; /* 0x8b */
-        classic_handler_table[WASM_OP_F32_NEG]               = &&HANDLE_CLASSIC_WASM_OP_F32_NEG; /* 0x8c */
-        classic_handler_table[WASM_OP_F32_CEIL]              = &&HANDLE_CLASSIC_WASM_OP_F32_CEIL; /* 0x8d */
-        classic_handler_table[WASM_OP_F32_FLOOR]             = &&HANDLE_CLASSIC_WASM_OP_F32_FLOOR; /* 0x8e */
-        classic_handler_table[WASM_OP_F32_TRUNC]             = &&HANDLE_CLASSIC_WASM_OP_F32_TRUNC; /* 0x8f */
-        classic_handler_table[WASM_OP_F32_NEAREST]           = &&HANDLE_CLASSIC_WASM_OP_F32_NEAREST; /* 0x90 */
-        classic_handler_table[WASM_OP_F32_SQRT]              = &&HANDLE_CLASSIC_WASM_OP_F32_SQRT; /* 0x91 */
-        classic_handler_table[WASM_OP_F32_ADD]               = &&HANDLE_CLASSIC_WASM_OP_F32_ADD; /* 0x92 */
-        classic_handler_table[WASM_OP_F32_SUB]               = &&HANDLE_CLASSIC_WASM_OP_F32_SUB; /* 0x93 */
-        classic_handler_table[WASM_OP_F32_MUL]               = &&HANDLE_CLASSIC_WASM_OP_F32_MUL; /* 0x94 */
-        classic_handler_table[WASM_OP_F32_DIV]               = &&HANDLE_CLASSIC_WASM_OP_F32_DIV; /* 0x95 */
-        classic_handler_table[WASM_OP_F32_MIN]               = &&HANDLE_CLASSIC_WASM_OP_F32_MIN; /* 0x96 */
-        classic_handler_table[WASM_OP_F32_MAX]               = &&HANDLE_CLASSIC_WASM_OP_F32_MAX; /* 0x97 */
-        classic_handler_table[WASM_OP_F32_COPYSIGN]          = &&HANDLE_CLASSIC_WASM_OP_F32_COPYSIGN; /* 0x98 */
-        classic_handler_table[WASM_OP_F64_ABS]               = &&HANDLE_CLASSIC_WASM_OP_F64_ABS; /* 0x99 */
-        classic_handler_table[WASM_OP_F64_NEG]               = &&HANDLE_CLASSIC_WASM_OP_F64_NEG; /* 0x9a */
-        classic_handler_table[WASM_OP_F64_CEIL]              = &&HANDLE_CLASSIC_WASM_OP_F64_CEIL; /* 0x9b */
-        classic_handler_table[WASM_OP_F64_FLOOR]             = &&HANDLE_CLASSIC_WASM_OP_F64_FLOOR; /* 0x9c */
-        classic_handler_table[WASM_OP_F64_TRUNC]             = &&HANDLE_CLASSIC_WASM_OP_F64_TRUNC; /* 0x9d */
-        classic_handler_table[WASM_OP_F64_NEAREST]           = &&HANDLE_CLASSIC_WASM_OP_F64_NEAREST; /* 0x9e */
-        classic_handler_table[WASM_OP_F64_SQRT]              = &&HANDLE_CLASSIC_WASM_OP_F64_SQRT; /* 0x9f */
-        classic_handler_table[WASM_OP_F64_ADD]               = &&HANDLE_CLASSIC_WASM_OP_F64_ADD; /* 0xa0 */
-        classic_handler_table[WASM_OP_F64_SUB]               = &&HANDLE_CLASSIC_WASM_OP_F64_SUB; /* 0xa1 */
-        classic_handler_table[WASM_OP_F64_MUL]               = &&HANDLE_CLASSIC_WASM_OP_F64_MUL; /* 0xa2 */
-        classic_handler_table[WASM_OP_F64_DIV]               = &&HANDLE_CLASSIC_WASM_OP_F64_DIV; /* 0xa3 */
-        classic_handler_table[WASM_OP_F64_MIN]               = &&HANDLE_CLASSIC_WASM_OP_F64_MIN; /* 0xa4 */
-        classic_handler_table[WASM_OP_F64_MAX]               = &&HANDLE_CLASSIC_WASM_OP_F64_MAX; /* 0xa5 */
-        classic_handler_table[WASM_OP_F64_COPYSIGN]          = &&HANDLE_CLASSIC_WASM_OP_F64_COPYSIGN; /* 0xa6 */
-        classic_handler_table[WASM_OP_I32_WRAP_I64]          = &&HANDLE_CLASSIC_WASM_OP_I32_WRAP_I64; /* 0xa7 */
-        classic_handler_table[WASM_OP_I32_TRUNC_S_F32]       = &&HANDLE_CLASSIC_WASM_OP_I32_TRUNC_S_F32; /* 0xa8 */
-        classic_handler_table[WASM_OP_I32_TRUNC_U_F32]       = &&HANDLE_CLASSIC_WASM_OP_I32_TRUNC_U_F32; /* 0xa9 */
-        classic_handler_table[WASM_OP_I32_TRUNC_S_F64]       = &&HANDLE_CLASSIC_WASM_OP_I32_TRUNC_S_F64; /* 0xaa */
-        classic_handler_table[WASM_OP_I32_TRUNC_U_F64]       = &&HANDLE_CLASSIC_WASM_OP_I32_TRUNC_U_F64; /* 0xab */
-        classic_handler_table[WASM_OP_I64_EXTEND_S_I32]      = &&HANDLE_CLASSIC_WASM_OP_I64_EXTEND_S_I32; /* 0xac */
-        classic_handler_table[WASM_OP_I64_EXTEND_U_I32]      = &&HANDLE_CLASSIC_WASM_OP_I64_EXTEND_U_I32; /* 0xad */
-        classic_handler_table[WASM_OP_I64_TRUNC_S_F32]       = &&HANDLE_CLASSIC_WASM_OP_I64_TRUNC_S_F32; /* 0xae */
-        classic_handler_table[WASM_OP_I64_TRUNC_U_F32]       = &&HANDLE_CLASSIC_WASM_OP_I64_TRUNC_U_F32; /* 0xaf */
-        classic_handler_table[WASM_OP_I64_TRUNC_S_F64]       = &&HANDLE_CLASSIC_WASM_OP_I64_TRUNC_S_F64; /* 0xb0 */
-        classic_handler_table[WASM_OP_I64_TRUNC_U_F64]       = &&HANDLE_CLASSIC_WASM_OP_I64_TRUNC_U_F64; /* 0xb1 */
-        classic_handler_table[WASM_OP_F32_CONVERT_S_I32]     = &&HANDLE_CLASSIC_WASM_OP_F32_CONVERT_S_I32; /* 0xb2 */
-        classic_handler_table[WASM_OP_F32_CONVERT_U_I32]     = &&HANDLE_CLASSIC_WASM_OP_F32_CONVERT_U_I32; /* 0xb3 */
-        classic_handler_table[WASM_OP_F32_CONVERT_S_I64]     = &&HANDLE_CLASSIC_WASM_OP_F32_CONVERT_S_I64; /* 0xb4 */
-        classic_handler_table[WASM_OP_F32_CONVERT_U_I64]     = &&HANDLE_CLASSIC_WASM_OP_F32_CONVERT_U_I64; /* 0xb5 */
-        classic_handler_table[WASM_OP_F32_DEMOTE_F64]        = &&HANDLE_CLASSIC_WASM_OP_F32_DEMOTE_F64; /* 0xb6 */
-        classic_handler_table[WASM_OP_F64_CONVERT_S_I32]     = &&HANDLE_CLASSIC_WASM_OP_F64_CONVERT_S_I32; /* 0xb7 */
-        classic_handler_table[WASM_OP_F64_CONVERT_U_I32]     = &&HANDLE_CLASSIC_WASM_OP_F64_CONVERT_U_I32; /* 0xb8 */
-        classic_handler_table[WASM_OP_F64_CONVERT_S_I64]     = &&HANDLE_CLASSIC_WASM_OP_F64_CONVERT_S_I64; /* 0xb9 */
-        classic_handler_table[WASM_OP_F64_CONVERT_U_I64]     = &&HANDLE_CLASSIC_WASM_OP_F64_CONVERT_U_I64; /* 0xba */
-        classic_handler_table[WASM_OP_F64_PROMOTE_F32]       = &&HANDLE_CLASSIC_WASM_OP_F64_PROMOTE_F32; /* 0xbb */
-        classic_handler_table[WASM_OP_I32_REINTERPRET_F32]   = &&HANDLE_CLASSIC_WASM_OP_F64_REINTERPRET_I64; /* 0xbc */
-        classic_handler_table[WASM_OP_I64_REINTERPRET_F64]   = &&HANDLE_CLASSIC_WASM_OP_F64_REINTERPRET_I64; /* 0xbd */
-        classic_handler_table[WASM_OP_F32_REINTERPRET_I32]   = &&HANDLE_CLASSIC_WASM_OP_F64_REINTERPRET_I64; /* 0xbe */
-        classic_handler_table[WASM_OP_F64_REINTERPRET_I64]   = &&HANDLE_CLASSIC_WASM_OP_F64_REINTERPRET_I64; /* 0xbf */
-        classic_handler_table[WASM_OP_I32_EXTEND8_S]         = &&HANDLE_CLASSIC_WASM_OP_I32_EXTEND8_S; /* 0xc0 */
-        classic_handler_table[WASM_OP_I32_EXTEND16_S]        = &&HANDLE_CLASSIC_WASM_OP_I32_EXTEND16_S; /* 0xc1 */
-        classic_handler_table[WASM_OP_I64_EXTEND8_S]         = &&HANDLE_CLASSIC_WASM_OP_I64_EXTEND8_S; /* 0xc2 */
-        classic_handler_table[WASM_OP_I64_EXTEND16_S]        = &&HANDLE_CLASSIC_WASM_OP_I64_EXTEND16_S; /* 0xc3 */
-        classic_handler_table[WASM_OP_I64_EXTEND32_S]        = &&HANDLE_CLASSIC_WASM_OP_I64_EXTEND32_S; /* 0xc4 */
-        classic_handler_table[WASM_OP_DROP_64]               = &&HANDLE_CLASSIC_WASM_OP_DROP_64; /* 0xc5 */
-        classic_handler_table[WASM_OP_SELECT_64]             = &&HANDLE_CLASSIC_WASM_OP_SELECT_64; /* 0xc6 */
-        classic_handler_table[EXT_OP_GET_LOCAL_FAST]         = &&HANDLE_CLASSIC_EXT_OP_GET_LOCAL_FAST; /* 0xc7 */
-        classic_handler_table[EXT_OP_SET_LOCAL_FAST_I64]     = &&classic_dispatch_label; /* 0xc8 */
-        classic_handler_table[EXT_OP_SET_LOCAL_FAST]         = &&HANDLE_CLASSIC_EXT_OP_SET_LOCAL_FAST; /* 0xc9 */
-        classic_handler_table[EXT_OP_TEE_LOCAL_FAST]         = &&HANDLE_CLASSIC_EXT_OP_TEE_LOCAL_FAST; /* 0xca */
-        classic_handler_table[EXT_OP_TEE_LOCAL_FAST_I64]     = &&classic_dispatch_label; /* 0xcb */
-        classic_handler_table[EXT_OP_COPY_STACK_TOP]         = &&classic_dispatch_label; /* 0xcc */
-        classic_handler_table[EXT_OP_COPY_STACK_TOP_I64]     = &&classic_dispatch_label; /* 0xcd */
-        classic_handler_table[EXT_OP_COPY_STACK_VALUES]      = &&classic_dispatch_label; /* 0xce */
-        classic_handler_table[WASM_OP_IMPDEP]                = &&HANDLE_CLASSIC_WASM_OP_IMPDEP; /* 0xcf */
-        classic_handler_table[WASM_OP_REF_NULL]              = &&HANDLE_CLASSIC_WASM_OP_REF_NULL; /* 0xd0 */
-        classic_handler_table[WASM_OP_REF_IS_NULL]           = &&HANDLE_CLASSIC_WASM_OP_REF_IS_NULL; /* 0xd1 */
-        classic_handler_table[WASM_OP_REF_FUNC]              = &&HANDLE_CLASSIC_WASM_OP_REF_FUNC; /* 0xd2 */
-        classic_handler_table[WASM_OP_REF_EQ]                = &&HANDLE_CLASSIC_WASM_OP_REF_EQ; /* 0xd3 */
-        classic_handler_table[WASM_OP_REF_AS_NON_NULL]       = &&HANDLE_CLASSIC_WASM_OP_REF_AS_NON_NULL; /* 0xd4 */
-        classic_handler_table[WASM_OP_BR_ON_NULL]            = &&HANDLE_CLASSIC_WASM_OP_BR_ON_NULL; /* 0xd5 */
-        classic_handler_table[WASM_OP_BR_ON_NON_NULL]        = &&HANDLE_CLASSIC_WASM_OP_BR_ON_NON_NULL; /* 0xd6 */
-        classic_handler_table[EXT_OP_BLOCK]                  = &&HANDLE_CLASSIC_EXT_OP_BLOCK; /* 0xd7 */
-        classic_handler_table[EXT_OP_LOOP]                   = &&HANDLE_CLASSIC_EXT_OP_LOOP; /* 0xd8 */
-        classic_handler_table[EXT_OP_IF]                     = &&HANDLE_CLASSIC_EXT_OP_IF; /* 0xd9 */
-        classic_handler_table[EXT_OP_BR_TABLE_CACHE]         = &&HANDLE_CLASSIC_EXT_OP_BR_TABLE_CACHE; /* 0xda */
-        classic_handler_table[EXT_OP_TRY]                    = &&HANDLE_CLASSIC_EXT_OP_TRY; /* 0xdb */
-        /* 0xdc-0xfa: reserved/unused, covered by loop above */
-        classic_handler_table[WASM_OP_GC_PREFIX]             = &&HANDLE_CLASSIC_WASM_OP_GC_PREFIX; /* 0xfb */
-        classic_handler_table[WASM_OP_MISC_PREFIX]           = &&HANDLE_CLASSIC_WASM_OP_MISC_PREFIX; /* 0xfc */
-        classic_handler_table[WASM_OP_SIMD_PREFIX]           = &&HANDLE_CLASSIC_WASM_OP_SIMD_PREFIX; /* 0xfd */
-        classic_handler_table[WASM_OP_ATOMIC_PREFIX]         = &&HANDLE_CLASSIC_WASM_OP_ATOMIC_PREFIX; /* 0xfe */
-        /* 0xff: reserved, covered by loop above */
-        /* Register table base address with hardware accelerator */
-        uint32_t tbl_addr = (uint32_t)(uintptr_t)&classic_handler_table[0];
-        asm volatile("csrw %0, %1" :: "i"(CSR_HANDLER_TBL), "r"(tbl_addr));
-        classic_handler_table_initialized = 1;
-    }
-#endif /* USE_ACCELERATOR */
+
+#if WASM_ENABLE_LABELS_AS_VALUES == 0
+
     while (frame_ip < frame_ip_end) {
         opcode = *frame_ip++;
         switch (opcode) {
@@ -1971,21 +1908,18 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             /* control instructions */
             HANDLE_OP(WASM_OP_UNREACHABLE)
             {
-                OPCODE_LABEL(WASM_OP_UNREACHABLE);
                 wasm_set_exception(module, "unreachable");
                 goto got_exception;
             }
 
             HANDLE_OP(WASM_OP_NOP)
             {
-                OPCODE_LABEL(WASM_OP_NOP);
                 HANDLE_OP_END();
             }
 
 #if WASM_ENABLE_EXCE_HANDLING != 0
             HANDLE_OP(WASM_OP_RETHROW)
             {
-                OPCODE_LABEL(WASM_OP_RETHROW);
                 int32_t relative_depth;
                 read_leb_int32(frame_ip, frame_ip_end, relative_depth);
 
@@ -2027,7 +1961,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_THROW)
             {
-                OPCODE_LABEL(WASM_OP_THROW);
                 read_leb_int32(frame_ip, frame_ip_end, exception_tag_index);
 
             /* landing pad for the rethrow ? */
@@ -2259,7 +2192,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(EXT_OP_TRY)
             {
-                OPCODE_LABEL(EXT_OP_TRY);
                 /* read the blocktype */
                 read_leb_uint32(frame_ip, frame_ip_end, type_index);
                 param_cell_num = wasm_types[type_index]->param_cell_num;
@@ -2269,7 +2201,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_TRY)
             {
-                OPCODE_LABEL(WASM_OP_TRY);
                 value_type = *frame_ip++;
                 param_cell_num = 0;
                 cell_num = wasm_value_type_cell_num(value_type);
@@ -2348,7 +2279,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             }
             HANDLE_OP(WASM_OP_CATCH)
             {
-                OPCODE_LABEL(WASM_OP_CATCH);
                 /* skip the tag_index */
                 skip_leb(frame_ip);
                 /* leave the frame */
@@ -2357,14 +2287,12 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             }
             HANDLE_OP(WASM_OP_CATCH_ALL)
             {
-                OPCODE_LABEL(WASM_OP_CATCH_ALL);
                 /* leave the frame */
                 POP_CSP_N(0);
                 HANDLE_OP_END();
             }
             HANDLE_OP(WASM_OP_DELEGATE)
             {
-                OPCODE_LABEL(WASM_OP_DELEGATE);
                 /* skip the delegate depth */
                 skip_leb(frame_ip);
                 /* leave the frame like WASM_OP_END */
@@ -2374,7 +2302,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 #endif /* end of WASM_ENABLE_EXCE_HANDLING != 0 */
             HANDLE_OP(EXT_OP_BLOCK)
             {
-                OPCODE_LABEL(EXT_OP_BLOCK);
                 read_leb_uint32(frame_ip, frame_ip_end, type_index);
                 param_cell_num =
                     ((WASMFuncType *)wasm_types[type_index])->param_cell_num;
@@ -2385,7 +2312,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_BLOCK)
             {
-                OPCODE_LABEL(WASM_OP_BLOCK);
                 value_type = *frame_ip++;
                 param_cell_num = 0;
                 cell_num = wasm_value_type_cell_num(value_type);
@@ -2417,7 +2343,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(EXT_OP_LOOP)
             {
-                OPCODE_LABEL(EXT_OP_LOOP);
                 read_leb_uint32(frame_ip, frame_ip_end, type_index);
                 param_cell_num =
                     ((WASMFuncType *)wasm_types[type_index])->param_cell_num;
@@ -2428,7 +2353,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_LOOP)
             {
-                OPCODE_LABEL(WASM_OP_LOOP);
                 value_type = *frame_ip++;
                 param_cell_num = 0;
                 cell_num = 0;
@@ -2439,7 +2363,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(EXT_OP_IF)
             {
-                OPCODE_LABEL(EXT_OP_IF);
                 read_leb_uint32(frame_ip, frame_ip_end, type_index);
                 param_cell_num =
                     ((WASMFuncType *)wasm_types[type_index])->param_cell_num;
@@ -2450,7 +2373,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_IF)
             {
-                OPCODE_LABEL(WASM_OP_IF);
                 value_type = *frame_ip++;
                 param_cell_num = 0;
                 cell_num = wasm_value_type_cell_num(value_type);
@@ -2496,7 +2418,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_ELSE)
             {
-                OPCODE_LABEL(WASM_OP_ELSE);
                 /* comes from the if branch in WASM_OP_IF */
                 frame_ip = (frame_csp - 1)->target_addr;
                 HANDLE_OP_END();
@@ -2504,7 +2425,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_END)
             {
-                OPCODE_LABEL(WASM_OP_END);
                 if (frame_csp > frame->csp_bottom + 1) {
                     POP_CSP();
                 }
@@ -2528,7 +2448,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_BR)
             {
-                OPCODE_LABEL(WASM_OP_BR);
 #if WASM_ENABLE_THREAD_MGR != 0
                 CHECK_SUSPEND_FLAGS();
 #endif
@@ -2550,7 +2469,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_BR_IF)
             {
-                OPCODE_LABEL(WASM_OP_BR_IF);
 #if WASM_ENABLE_THREAD_MGR != 0
                 CHECK_SUSPEND_FLAGS();
 #endif
@@ -2563,7 +2481,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_BR_TABLE)
             {
-                OPCODE_LABEL(WASM_OP_BR_TABLE);
 #if WASM_ENABLE_THREAD_MGR != 0
                 CHECK_SUSPEND_FLAGS();
 #endif
@@ -2577,7 +2494,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(EXT_OP_BR_TABLE_CACHE)
             {
-                OPCODE_LABEL(EXT_OP_BR_TABLE_CACHE);
                 BrTableCache *node_cache =
                     bh_list_first_elem(module->module->br_table_cache_list);
                 BrTableCache *node_next;
@@ -2603,7 +2519,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_RETURN)
             {
-                OPCODE_LABEL(WASM_OP_RETURN);
                 frame_sp -= cur_func->ret_cell_num;
                 for (i = 0; i < cur_func->ret_cell_num; i++) {
 #if WASM_ENABLE_GC != 0
@@ -2621,7 +2536,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_CALL)
             {
-                OPCODE_LABEL(WASM_OP_CALL);
 #if WASM_ENABLE_THREAD_MGR != 0
                 CHECK_SUSPEND_FLAGS();
 #endif
@@ -2640,7 +2554,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 #if WASM_ENABLE_TAIL_CALL != 0
             HANDLE_OP(WASM_OP_RETURN_CALL)
             {
-                OPCODE_LABEL(WASM_OP_RETURN_CALL);
 #if WASM_ENABLE_THREAD_MGR != 0
                 CHECK_SUSPEND_FLAGS();
 #endif
@@ -2662,7 +2575,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             HANDLE_OP(WASM_OP_RETURN_CALL_INDIRECT)
 #endif
             {
-                OPCODE_LABEL(WASM_OP_RETURN_CALL_INDIRECT);
                 WASMFuncType *cur_type, *cur_func_type;
                 WASMTableInstance *tbl_inst;
                 uint32 tbl_idx;
@@ -2764,7 +2676,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             /* parametric instructions */
             HANDLE_OP(WASM_OP_DROP)
             {
-                OPCODE_LABEL(WASM_OP_DROP);
                 frame_sp--;
 
 #if WASM_ENABLE_GC != 0
@@ -2776,7 +2687,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_DROP_64)
             {
-                OPCODE_LABEL(WASM_OP_DROP_64);
                 frame_sp -= 2;
 
 #if WASM_ENABLE_GC != 0
@@ -2790,7 +2700,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_SELECT)
             {
-                OPCODE_LABEL(WASM_OP_SELECT);
                 cond = (uint32)POP_I32();
                 frame_sp--;
                 if (!cond)
@@ -2800,7 +2709,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_SELECT_64)
             {
-                OPCODE_LABEL(WASM_OP_SELECT_64);
                 cond = (uint32)POP_I32();
                 frame_sp -= 2;
                 if (!cond) {
@@ -2813,7 +2721,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 #if WASM_ENABLE_REF_TYPES != 0 || WASM_ENABLE_GC != 0
             HANDLE_OP(WASM_OP_SELECT_T)
             {
-                OPCODE_LABEL(WASM_OP_SELECT_T);
                 uint32 vec_len;
                 uint8 type;
 
@@ -2851,7 +2758,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_TABLE_GET)
             {
-                OPCODE_LABEL(WASM_OP_TABLE_GET);
                 uint32 tbl_idx;
                 tbl_elem_idx_t elem_idx;
                 WASMTableInstance *tbl_inst;
@@ -2880,7 +2786,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_TABLE_SET)
             {
-                OPCODE_LABEL(WASM_OP_TABLE_SET);
                 WASMTableInstance *tbl_inst;
                 uint32 tbl_idx;
                 tbl_elem_idx_t elem_idx;
@@ -2911,7 +2816,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_REF_NULL)
             {
-                OPCODE_LABEL(WASM_OP_REF_NULL);
                 uint32 ref_type;
                 read_leb_uint32(frame_ip, frame_ip_end, ref_type);
 #if WASM_ENABLE_GC == 0
@@ -2925,7 +2829,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_REF_IS_NULL)
             {
-                OPCODE_LABEL(WASM_OP_REF_IS_NULL);
 #if WASM_ENABLE_GC == 0
                 uint32 ref_val;
                 ref_val = POP_I32();
@@ -2939,7 +2842,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_REF_FUNC)
             {
-                OPCODE_LABEL(WASM_OP_REF_FUNC);
                 uint32 func_idx;
                 read_leb_uint32(frame_ip, frame_ip_end, func_idx);
 #if WASM_ENABLE_GC == 0
@@ -2959,7 +2861,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 #if WASM_ENABLE_GC != 0
             HANDLE_OP(WASM_OP_CALL_REF)
             {
-                OPCODE_LABEL(WASM_OP_CALL_REF);
 #if WASM_ENABLE_THREAD_MGR != 0
                 CHECK_SUSPEND_FLAGS();
 #endif
@@ -2977,7 +2878,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_RETURN_CALL_REF)
             {
-                OPCODE_LABEL(WASM_OP_RETURN_CALL_REF);
 #if WASM_ENABLE_THREAD_MGR != 0
                 CHECK_SUSPEND_FLAGS();
 #endif
@@ -2995,7 +2895,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_REF_EQ)
             {
-                OPCODE_LABEL(WASM_OP_REF_EQ);
                 WASMObjectRef gc_obj1, gc_obj2;
                 gc_obj2 = POP_REF();
                 gc_obj1 = POP_REF();
@@ -3006,7 +2905,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_REF_AS_NON_NULL)
             {
-                OPCODE_LABEL(WASM_OP_REF_AS_NON_NULL);
                 gc_obj = POP_REF();
                 if (gc_obj == NULL_REF) {
                     wasm_set_exception(module, "null reference");
@@ -3018,7 +2916,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_BR_ON_NULL)
             {
-                OPCODE_LABEL(WASM_OP_BR_ON_NULL);
 #if WASM_ENABLE_THREAD_MGR != 0
                 CHECK_SUSPEND_FLAGS();
 #endif
@@ -3034,7 +2931,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_BR_ON_NON_NULL)
             {
-                OPCODE_LABEL(WASM_OP_BR_ON_NON_NULL);
 #if WASM_ENABLE_THREAD_MGR != 0
                 CHECK_SUSPEND_FLAGS();
 #endif
@@ -3052,7 +2948,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_GC_PREFIX)
             {
-                OPCODE_LABEL(WASM_OP_GC_PREFIX);
                 uint32 opcode1;
 
                 read_leb_uint32(frame_ip, frame_ip_end, opcode1);
@@ -4475,7 +4370,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             /* variable instructions */
             HANDLE_OP(WASM_OP_GET_LOCAL)
             {
-                OPCODE_LABEL(WASM_OP_GET_LOCAL);
                 GET_LOCAL_INDEX_TYPE_AND_OFFSET();
 
                 switch (local_type) {
@@ -4516,7 +4410,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(EXT_OP_GET_LOCAL_FAST)
             {
-                OPCODE_LABEL(EXT_OP_GET_LOCAL_FAST);
                 local_offset = *frame_ip++;
                 if (local_offset & 0x80)
                     PUSH_I64(
@@ -4528,7 +4421,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_SET_LOCAL)
             {
-                OPCODE_LABEL(WASM_OP_SET_LOCAL);
                 GET_LOCAL_INDEX_TYPE_AND_OFFSET();
 
                 switch (local_type) {
@@ -4563,7 +4455,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(EXT_OP_SET_LOCAL_FAST)
             {
-                OPCODE_LABEL(EXT_OP_SET_LOCAL_FAST);
                 local_offset = *frame_ip++;
                 if (local_offset & 0x80)
                     PUT_I64_TO_ADDR(
@@ -4576,7 +4467,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_TEE_LOCAL)
             {
-                OPCODE_LABEL(WASM_OP_TEE_LOCAL);
                 GET_LOCAL_INDEX_TYPE_AND_OFFSET();
 
                 switch (local_type) {
@@ -4614,7 +4504,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(EXT_OP_TEE_LOCAL_FAST)
             {
-                OPCODE_LABEL(EXT_OP_TEE_LOCAL_FAST);
                 local_offset = *frame_ip++;
                 if (local_offset & 0x80)
                     PUT_I64_TO_ADDR(
@@ -4628,7 +4517,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_GET_GLOBAL)
             {
-                OPCODE_LABEL(WASM_OP_GET_GLOBAL);
                 read_leb_uint32(frame_ip, frame_ip_end, global_idx);
                 bh_assert(global_idx < module->e->global_count);
                 global = globals + global_idx;
@@ -4653,7 +4541,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_GET_GLOBAL_64)
             {
-                OPCODE_LABEL(WASM_OP_GET_GLOBAL_64);
                 read_leb_uint32(frame_ip, frame_ip_end, global_idx);
                 bh_assert(global_idx < module->e->global_count);
                 global = globals + global_idx;
@@ -4664,7 +4551,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_SET_GLOBAL)
             {
-                OPCODE_LABEL(WASM_OP_SET_GLOBAL);
                 read_leb_uint32(frame_ip, frame_ip_end, global_idx);
                 bh_assert(global_idx < module->e->global_count);
                 global = globals + global_idx;
@@ -4684,7 +4570,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_SET_GLOBAL_AUX_STACK)
             {
-                OPCODE_LABEL(WASM_OP_SET_GLOBAL_AUX_STACK);
                 uint64 aux_stack_top;
 
                 read_leb_uint32(frame_ip, frame_ip_end, global_idx);
@@ -4734,7 +4619,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_SET_GLOBAL_64)
             {
-                OPCODE_LABEL(WASM_OP_SET_GLOBAL_64);
                 read_leb_uint32(frame_ip, frame_ip_end, global_idx);
                 bh_assert(global_idx < module->e->global_count);
                 global = globals + global_idx;
@@ -4747,16 +4631,17 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             HANDLE_OP(WASM_OP_I32_LOAD)
             HANDLE_OP(WASM_OP_F32_LOAD)
             {
-                OPCODE_LABEL(WASM_OP_F32_LOAD);
                 uint32 flags;
                 mem_offset_t offset, addr;
+                uint32 cur_op = (uint32)*(frame_ip - 1);
 
                 read_leb_memarg(frame_ip, frame_ip_end, flags);
                 read_leb_mem_offset(frame_ip, frame_ip_end, offset);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
-                addr = POP_MEM_OFFSET();
+                TRIGGER_MEM_ACCELERATOR(frame_ip, 0);
+                addr = POP_MEM_OFFSET(); //pop runtime base adress from stack (frame-sp)
+                TRACE_LOAD_ACCESS(4);
                 CHECK_MEMORY_OVERFLOW(4);
-                PUSH_I32(LOAD_I32(maddr));
+                PUSH_I32(LOAD_I32(maddr)); // reads 4 bytes from the native memory pointer (*(int32 *)maddr) and pushes it back into wasm stack (*(int32 *)frame_sp = ...; frame_sp++;).
                 CHECK_READ_WATCHPOINT(addr, offset);
                 // HANDLE_OP_END();
                 ACCELERATED_OP_END();
@@ -4765,204 +4650,216 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             HANDLE_OP(WASM_OP_I64_LOAD)
             HANDLE_OP(WASM_OP_F64_LOAD)
             {
-                OPCODE_LABEL(WASM_OP_F64_LOAD);
                 uint32 flags;
                 mem_offset_t offset, addr;
 
+                uint32 cur_op = (uint32)*(frame_ip - 1);
                 read_leb_memarg(frame_ip, frame_ip_end, flags);
                 read_leb_mem_offset(frame_ip, frame_ip_end, offset);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                TRIGGER_MEM_ACCELERATOR(frame_ip, 0);
                 addr = POP_MEM_OFFSET();
+                TRACE_LOAD_ACCESS(8);
                 CHECK_MEMORY_OVERFLOW(8);
                 PUSH_I64(LOAD_I64(maddr));
                 CHECK_READ_WATCHPOINT(addr, offset);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_LOAD8_S)
             {
-                OPCODE_LABEL(WASM_OP_I32_LOAD8_S);
                 uint32 flags;
                 mem_offset_t offset, addr;
 
+                uint32 cur_op = (uint32)*(frame_ip - 1);
                 read_leb_memarg(frame_ip, frame_ip_end, flags);
                 read_leb_mem_offset(frame_ip, frame_ip_end, offset);
                 TRIGGER_ACCELERATOR(frame_ip, 0);
                 addr = POP_MEM_OFFSET();
+                TRACE_LOAD_ACCESS(1);
                 CHECK_MEMORY_OVERFLOW(1);
                 PUSH_I32(sign_ext_8_32(*(int8 *)maddr));
                 CHECK_READ_WATCHPOINT(addr, offset);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_LOAD8_U)
             {
-                OPCODE_LABEL(WASM_OP_I32_LOAD8_U);
                 uint32 flags;
                 mem_offset_t offset, addr;
 
+                uint32 cur_op = (uint32)*(frame_ip - 1);
                 read_leb_memarg(frame_ip, frame_ip_end, flags);
                 read_leb_mem_offset(frame_ip, frame_ip_end, offset);
                 TRIGGER_ACCELERATOR(frame_ip, 0);
                 addr = POP_MEM_OFFSET();
+                TRACE_LOAD_ACCESS(1);
                 CHECK_MEMORY_OVERFLOW(1);
                 PUSH_I32((uint32)(*(uint8 *)maddr));
                 CHECK_READ_WATCHPOINT(addr, offset);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_LOAD16_S)
             {
-                OPCODE_LABEL(WASM_OP_I32_LOAD16_S);
                 uint32 flags;
                 mem_offset_t offset, addr;
 
+                uint32 cur_op = (uint32)*(frame_ip - 1);
                 read_leb_memarg(frame_ip, frame_ip_end, flags);
                 read_leb_mem_offset(frame_ip, frame_ip_end, offset);
                 TRIGGER_ACCELERATOR(frame_ip, 0);
                 addr = POP_MEM_OFFSET();
+                TRACE_LOAD_ACCESS(2);
                 CHECK_MEMORY_OVERFLOW(2);
                 PUSH_I32(sign_ext_16_32(LOAD_I16(maddr)));
                 CHECK_READ_WATCHPOINT(addr, offset);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_LOAD16_U)
             {
-                OPCODE_LABEL(WASM_OP_I32_LOAD16_U);
                 uint32 flags;
                 mem_offset_t offset, addr;
 
+                uint32 cur_op = (uint32)*(frame_ip - 1);
                 read_leb_memarg(frame_ip, frame_ip_end, flags);
                 read_leb_mem_offset(frame_ip, frame_ip_end, offset);
                 TRIGGER_ACCELERATOR(frame_ip, 0);
                 addr = POP_MEM_OFFSET();
+                TRACE_LOAD_ACCESS(2);
                 CHECK_MEMORY_OVERFLOW(2);
                 PUSH_I32((uint32)(LOAD_U16(maddr)));
                 CHECK_READ_WATCHPOINT(addr, offset);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_LOAD8_S)
             {
-                OPCODE_LABEL(WASM_OP_I64_LOAD8_S);
                 uint32 flags;
                 mem_offset_t offset, addr;
 
+                uint32 cur_op = (uint32)*(frame_ip - 1);
                 read_leb_memarg(frame_ip, frame_ip_end, flags);
                 read_leb_mem_offset(frame_ip, frame_ip_end, offset);
                 TRIGGER_ACCELERATOR(frame_ip, 0);
                 addr = POP_MEM_OFFSET();
+                TRACE_LOAD_ACCESS(1);
                 CHECK_MEMORY_OVERFLOW(1);
                 PUSH_I64(sign_ext_8_64(*(int8 *)maddr));
                 CHECK_READ_WATCHPOINT(addr, offset);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_LOAD8_U)
             {
-                OPCODE_LABEL(WASM_OP_I64_LOAD8_U);
                 uint32 flags;
                 mem_offset_t offset, addr;
+                uint32 cur_op = (uint32)*(frame_ip - 1);
 
                 read_leb_memarg(frame_ip, frame_ip_end, flags);
                 read_leb_mem_offset(frame_ip, frame_ip_end, offset);
                 TRIGGER_ACCELERATOR(frame_ip, 0);
                 addr = POP_MEM_OFFSET();
+                TRACE_LOAD_ACCESS(1);
                 CHECK_MEMORY_OVERFLOW(1);
                 PUSH_I64((uint64)(*(uint8 *)maddr));
                 CHECK_READ_WATCHPOINT(addr, offset);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_LOAD16_S)
             {
-                OPCODE_LABEL(WASM_OP_I64_LOAD16_S);
                 uint32 flags;
                 mem_offset_t offset, addr;
 
+                uint32 cur_op = (uint32)*(frame_ip - 1);
                 read_leb_memarg(frame_ip, frame_ip_end, flags);
                 read_leb_mem_offset(frame_ip, frame_ip_end, offset);
                 TRIGGER_ACCELERATOR(frame_ip, 0);
                 addr = POP_MEM_OFFSET();
+                TRACE_LOAD_ACCESS(2);
                 CHECK_MEMORY_OVERFLOW(2);
                 PUSH_I64(sign_ext_16_64(LOAD_I16(maddr)));
                 CHECK_READ_WATCHPOINT(addr, offset);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_LOAD16_U)
             {
-                OPCODE_LABEL(WASM_OP_I64_LOAD16_U);
                 uint32 flags;
                 mem_offset_t offset, addr;
 
+                uint32 cur_op = (uint32)*(frame_ip - 1);
                 read_leb_memarg(frame_ip, frame_ip_end, flags);
                 read_leb_mem_offset(frame_ip, frame_ip_end, offset);
                 TRIGGER_ACCELERATOR(frame_ip, 0);
                 addr = POP_MEM_OFFSET();
+                TRACE_LOAD_ACCESS(2);
                 CHECK_MEMORY_OVERFLOW(2);
                 PUSH_I64((uint64)(LOAD_U16(maddr)));
                 CHECK_READ_WATCHPOINT(addr, offset);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_LOAD32_S)
             {
-                OPCODE_LABEL(WASM_OP_I64_LOAD32_S);
                 uint32 flags;
                 mem_offset_t offset, addr;
 
+                uint32 cur_op = (uint32)*(frame_ip - 1);
                 read_leb_memarg(frame_ip, frame_ip_end, flags);
                 read_leb_mem_offset(frame_ip, frame_ip_end, offset);
                 TRIGGER_ACCELERATOR(frame_ip, 0);
                 addr = POP_MEM_OFFSET();
+                TRACE_LOAD_ACCESS(4);
                 CHECK_MEMORY_OVERFLOW(4);
                 PUSH_I64(sign_ext_32_64(LOAD_I32(maddr)));
                 CHECK_READ_WATCHPOINT(addr, offset);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_LOAD32_U)
             {
-                OPCODE_LABEL(WASM_OP_I64_LOAD32_U);
                 uint32 flags;
                 mem_offset_t offset, addr;
 
+                uint32 cur_op = (uint32)*(frame_ip - 1);
                 read_leb_memarg(frame_ip, frame_ip_end, flags);
                 read_leb_mem_offset(frame_ip, frame_ip_end, offset);
                 TRIGGER_ACCELERATOR(frame_ip, 0);
                 addr = POP_MEM_OFFSET();
+                TRACE_LOAD_ACCESS(4);
                 CHECK_MEMORY_OVERFLOW(4);
                 PUSH_I64((uint64)(LOAD_U32(maddr)));
                 CHECK_READ_WATCHPOINT(addr, offset);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             /* memory store instructions */
             HANDLE_OP(WASM_OP_I32_STORE)
             HANDLE_OP(WASM_OP_F32_STORE)
             {
-                OPCODE_LABEL(WASM_OP_F32_STORE);
                 uint32 flags;
                 mem_offset_t offset, addr;
 
+                uint32 cur_op = (uint32)*(frame_ip - 1);
                 read_leb_memarg(frame_ip, frame_ip_end, flags);
                 read_leb_mem_offset(frame_ip, frame_ip_end, offset);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                TRIGGER_MEM_ACCELERATOR(frame_ip, 0);
                 frame_sp--;
                 addr = POP_MEM_OFFSET();
+                TRACE_STORE_ACCESS(4, frame_sp[1]);
                 CHECK_MEMORY_OVERFLOW(4);
 #if WASM_ENABLE_MEMORY64 != 0
                 if (is_memory64) {
@@ -4981,15 +4878,16 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             HANDLE_OP(WASM_OP_I64_STORE)
             HANDLE_OP(WASM_OP_F64_STORE)
             {
-                OPCODE_LABEL(WASM_OP_F64_STORE);
                 uint32 flags;
                 mem_offset_t offset, addr;
 
+                uint32 cur_op = (uint32)*(frame_ip - 1);
                 read_leb_memarg(frame_ip, frame_ip_end, flags);
                 read_leb_mem_offset(frame_ip, frame_ip_end, offset);
                 TRIGGER_ACCELERATOR(frame_ip, 0);
                 frame_sp -= 2;
                 addr = POP_MEM_OFFSET();
+                TRACE_STORE_ACCESS(8, (uint32)GET_I64_FROM_ADDR(frame_sp + 1));
                 CHECK_MEMORY_OVERFLOW(8);
 
 #if WASM_ENABLE_MEMORY64 != 0
@@ -5011,12 +4909,12 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             HANDLE_OP(WASM_OP_I32_STORE8)
             HANDLE_OP(WASM_OP_I32_STORE16)
             {
-                OPCODE_LABEL(WASM_OP_I32_STORE16);
                 uint32 flags;
                 mem_offset_t offset, addr;
                 uint32 sval;
+                uint32 cur_op = (uint32)*(frame_ip - 1);
 
-                opcode = *(frame_ip - 1);
+                opcode = (uint8)cur_op;
                 read_leb_memarg(frame_ip, frame_ip_end, flags);
                 read_leb_mem_offset(frame_ip, frame_ip_end, offset);
                 TRIGGER_ACCELERATOR(frame_ip, 0);
@@ -5024,10 +4922,12 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 addr = POP_MEM_OFFSET();
 
                 if (opcode == WASM_OP_I32_STORE8) {
+                    TRACE_STORE_ACCESS(1, sval);
                     CHECK_MEMORY_OVERFLOW(1);
                     *(uint8 *)maddr = (uint8)sval;
                 }
                 else {
+                    TRACE_STORE_ACCESS(2, sval);
                     CHECK_MEMORY_OVERFLOW(2);
                     STORE_U16(maddr, (uint16)sval);
                 }
@@ -5040,12 +4940,12 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             HANDLE_OP(WASM_OP_I64_STORE16)
             HANDLE_OP(WASM_OP_I64_STORE32)
             {
-                OPCODE_LABEL(WASM_OP_I64_STORE32);
                 uint32 flags;
                 mem_offset_t offset, addr;
                 uint64 sval;
+                uint32 cur_op = (uint32)*(frame_ip - 1);
 
-                opcode = *(frame_ip - 1);
+                opcode = (uint8)cur_op;
                 read_leb_memarg(frame_ip, frame_ip_end, flags);
                 read_leb_mem_offset(frame_ip, frame_ip_end, offset);
                 TRIGGER_ACCELERATOR(frame_ip, 0);
@@ -5053,14 +4953,17 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 addr = POP_MEM_OFFSET();
 
                 if (opcode == WASM_OP_I64_STORE8) {
+                    TRACE_STORE_ACCESS(1, (uint32)sval);
                     CHECK_MEMORY_OVERFLOW(1);
                     *(uint8 *)maddr = (uint8)sval;
                 }
                 else if (opcode == WASM_OP_I64_STORE16) {
+                    TRACE_STORE_ACCESS(2, (uint32)sval);
                     CHECK_MEMORY_OVERFLOW(2);
                     STORE_U16(maddr, (uint16)sval);
                 }
                 else {
+                    TRACE_STORE_ACCESS(4, (uint32)sval);
                     CHECK_MEMORY_OVERFLOW(4);
                     STORE_U32(maddr, (uint32)sval);
                 }
@@ -5072,7 +4975,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             /* memory size and memory grow instructions */
             HANDLE_OP(WASM_OP_MEMORY_SIZE)
             {
-                OPCODE_LABEL(WASM_OP_MEMORY_SIZE);
                 uint32 mem_idx;
                 read_leb_memidx(frame_ip, frame_ip_end, mem_idx);
                 PUSH_PAGE_COUNT(memory->cur_page_count);
@@ -5081,7 +4983,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_MEMORY_GROW)
             {
-                OPCODE_LABEL(WASM_OP_MEMORY_GROW);
                 uint32 mem_idx, prev_page_count;
                 mem_offset_t delta;
 
@@ -5116,7 +5017,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             /* constant instructions */
             HANDLE_OP(WASM_OP_I32_CONST)
             {
-                OPCODE_LABEL(WASM_OP_I32_CONST);
                 DEF_OP_I_CONST(int32, I32);
                 HANDLE_OP_END();
         }
@@ -5124,14 +5024,12 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_I64_CONST)
             {
-                OPCODE_LABEL(WASM_OP_I64_CONST);
                 DEF_OP_I_CONST(int64, I64);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_CONST)
             {
-                OPCODE_LABEL(WASM_OP_F32_CONST);
                 uint8 *p_float = (uint8 *)frame_sp++;
                 for (i = 0; i < sizeof(float32); i++)
                     *p_float++ = *frame_ip++;
@@ -5140,7 +5038,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_F64_CONST)
             {
-                OPCODE_LABEL(WASM_OP_F64_CONST);
                 uint8 *p_float = (uint8 *)frame_sp++;
                 frame_sp++;
                 for (i = 0; i < sizeof(float64); i++)
@@ -5151,244 +5048,218 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             /* comparison instructions of i32 */
             HANDLE_OP(WASM_OP_I32_EQZ)
             {
-                OPCODE_LABEL(WASM_OP_I32_EQZ);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_EQZ(I32);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_EQ)
             {
-                OPCODE_LABEL(WASM_OP_I32_EQ);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_CMP(uint32, I32, ==);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_NE)
             {
-                OPCODE_LABEL(WASM_OP_I32_NE);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_CMP(uint32, I32, !=);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_LT_S)
             {
-                OPCODE_LABEL(WASM_OP_I32_LT_S);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_CMP(int32, I32, <);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_LT_U)
             {
-                OPCODE_LABEL(WASM_OP_I32_LT_U);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_CMP(uint32, I32, <);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_GT_S)
             {
-                OPCODE_LABEL(WASM_OP_I32_GT_S);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_CMP(int32, I32, >);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_GT_U)
             {
-                OPCODE_LABEL(WASM_OP_I32_GT_U);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_CMP(uint32, I32, >);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_LE_S)
             {
-                OPCODE_LABEL(WASM_OP_I32_LE_S);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_CMP(int32, I32, <=);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_LE_U)
             {
-                OPCODE_LABEL(WASM_OP_I32_LE_U);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_CMP(uint32, I32, <=);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_GE_S)
             {
-                OPCODE_LABEL(WASM_OP_I32_GE_S);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_CMP(int32, I32, >=);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_GE_U)
             {
-                OPCODE_LABEL(WASM_OP_I32_GE_U);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_CMP(uint32, I32, >=);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             /* comparison instructions of i64 */
             HANDLE_OP(WASM_OP_I64_EQZ)
             {
-                OPCODE_LABEL(WASM_OP_I64_EQZ);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_EQZ(I64);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_EQ)
             {
-                OPCODE_LABEL(WASM_OP_I64_EQ);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_CMP(uint64, I64, ==);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_NE)
             {
-                OPCODE_LABEL(WASM_OP_I64_NE);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_CMP(uint64, I64, !=);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_LT_S)
             {
-                OPCODE_LABEL(WASM_OP_I64_LT_S);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_CMP(int64, I64, <);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_LT_U)
             {
-                OPCODE_LABEL(WASM_OP_I64_LT_U);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_CMP(uint64, I64, <);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_GT_S)
             {
-                OPCODE_LABEL(WASM_OP_I64_GT_S);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_CMP(int64, I64, >);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_GT_U)
             {
-                OPCODE_LABEL(WASM_OP_I64_GT_U);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_CMP(uint64, I64, >);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_LE_S)
             {
-                OPCODE_LABEL(WASM_OP_I64_LE_S);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_CMP(int64, I64, <=);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_LE_U)
             {
-                OPCODE_LABEL(WASM_OP_I64_LE_U);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_CMP(uint64, I64, <=);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_GE_S)
             {
-                OPCODE_LABEL(WASM_OP_I64_GE_S);
-                TRIGGER_ACCELERATOR(frame_ip, 0);   
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_CMP(int64, I64, >=);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_GE_U)
             {
-                OPCODE_LABEL(WASM_OP_I64_GE_U);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_CMP(uint64, I64, >=);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             /* comparison instructions of f32 */
             HANDLE_OP(WASM_OP_F32_EQ)
             {
-                OPCODE_LABEL(WASM_OP_F32_EQ);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_CMP(float32, F32, ==);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_NE)
             {
-                OPCODE_LABEL(WASM_OP_F32_NE);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_CMP(float32, F32, !=);
                 HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_LT)
             {
-                OPCODE_LABEL(WASM_OP_F32_LT);
                 DEF_OP_CMP(float32, F32, <);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_GT)
             {
-                OPCODE_LABEL(WASM_OP_F32_GT);
                 DEF_OP_CMP(float32, F32, >);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_LE)
             {
-                OPCODE_LABEL(WASM_OP_F32_LE);
                 DEF_OP_CMP(float32, F32, <=);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_GE)
             {
-                OPCODE_LABEL(WASM_OP_F32_GE);
                 DEF_OP_CMP(float32, F32, >=);
                 HANDLE_OP_END();
             }
@@ -5396,42 +5267,36 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             /* comparison instructions of f64 */
             HANDLE_OP(WASM_OP_F64_EQ)
             {
-                OPCODE_LABEL(WASM_OP_F64_EQ);
                 DEF_OP_CMP(float64, F64, ==);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_NE)
             {
-                OPCODE_LABEL(WASM_OP_F64_NE);
                 DEF_OP_CMP(float64, F64, !=);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_LT)
             {
-                OPCODE_LABEL(WASM_OP_F64_LT);
                 DEF_OP_CMP(float64, F64, <);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_GT)
             {
-                OPCODE_LABEL(WASM_OP_F64_GT);
                 DEF_OP_CMP(float64, F64, >);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_LE)
             {
-                OPCODE_LABEL(WASM_OP_F64_LE);
                 DEF_OP_CMP(float64, F64, <=);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_GE)
             {
-                OPCODE_LABEL(WASM_OP_F64_GE);
                 DEF_OP_CMP(float64, F64, >=);
                 HANDLE_OP_END();
             }
@@ -5439,55 +5304,48 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             /* numeric instructions of i32 */
             HANDLE_OP(WASM_OP_I32_CLZ)
             {
-                OPCODE_LABEL(WASM_OP_I32_CLZ);
                 DEF_OP_BIT_COUNT(uint32, I32, clz32);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_CTZ)
             {
-                OPCODE_LABEL(WASM_OP_I32_CTZ);
                 DEF_OP_BIT_COUNT(uint32, I32, ctz32);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_POPCNT)
             {
-                OPCODE_LABEL(WASM_OP_I32_POPCNT);
                 DEF_OP_BIT_COUNT(uint32, I32, popcount32);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_ADD)
             {
-                OPCODE_LABEL(WASM_OP_I32_ADD);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_NUMERIC(uint32, uint32, I32, +);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_SUB)
             {
-                OPCODE_LABEL(WASM_OP_I32_SUB);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_NUMERIC(uint32, uint32, I32, -);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_MUL)
             {
-                OPCODE_LABEL(WASM_OP_I32_MUL);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_NUMERIC(uint32, uint32, I32, *);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_DIV_S)
             {
-                OPCODE_LABEL(WASM_OP_I32_DIV_S);
                 int32 a, b;
 
                 b = POP_I32();
@@ -5506,7 +5364,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_I32_DIV_U)
             {
-                OPCODE_LABEL(WASM_OP_I32_DIV_U);
                 uint32 a, b;
 
                 b = (uint32)POP_I32();
@@ -5521,7 +5378,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_I32_REM_S)
             {
-                OPCODE_LABEL(WASM_OP_I32_REM_S);
                 int32 a, b;
 
                 b = POP_I32();
@@ -5540,7 +5396,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_I32_REM_U)
             {
-                OPCODE_LABEL(WASM_OP_I32_REM_U);
                 uint32 a, b;
 
                 b = (uint32)POP_I32();
@@ -5555,136 +5410,121 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_I32_AND)
             {
-                OPCODE_LABEL(WASM_OP_I32_AND);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_NUMERIC(uint32, uint32, I32, &);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_OR)
             {
-                OPCODE_LABEL(WASM_OP_I32_OR);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_NUMERIC(uint32, uint32, I32, |);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_XOR)
             {
-                OPCODE_LABEL(WASM_OP_I32_XOR);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_NUMERIC(uint32, uint32, I32, ^);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_SHL)
             {
-                OPCODE_LABEL(WASM_OP_I32_SHL);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_NUMERIC2(uint32, uint32, I32, <<);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_SHR_S)
             {
-                OPCODE_LABEL(WASM_OP_I32_SHR_S);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_NUMERIC2(int32, uint32, I32, >>);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_SHR_U)
             {
-                OPCODE_LABEL(WASM_OP_I32_SHR_U);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_NUMERIC2(uint32, uint32, I32, >>);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_ROTL)
             {
-                OPCODE_LABEL(WASM_OP_I32_ROTL);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 uint32 a, b;
 
                 b = (uint32)POP_I32();
                 a = (uint32)POP_I32();
                 PUSH_I32(rotl32(a, b));
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_ROTR)
             {
-                OPCODE_LABEL(WASM_OP_I32_ROTR);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 uint32 a, b;
 
                 b = (uint32)POP_I32();
                 a = (uint32)POP_I32();
                 PUSH_I32(rotr32(a, b));
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             /* numeric instructions of i64 */
             HANDLE_OP(WASM_OP_I64_CLZ)
             {
-                OPCODE_LABEL(WASM_OP_I64_CLZ);
                 DEF_OP_BIT_COUNT(uint64, I64, clz64);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_CTZ)
             {
-                OPCODE_LABEL(WASM_OP_I64_CTZ);
                 DEF_OP_BIT_COUNT(uint64, I64, ctz64);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_POPCNT)
             {
-                OPCODE_LABEL(WASM_OP_I64_POPCNT);
                 DEF_OP_BIT_COUNT(uint64, I64, popcount64);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_ADD)
             {
-                OPCODE_LABEL(WASM_OP_I64_ADD);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_NUMERIC_64(uint64, uint64, I64, +);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_SUB)
             {
-                OPCODE_LABEL(WASM_OP_I64_SUB);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_NUMERIC_64(uint64, uint64, I64, -);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_MUL)
             {
-                OPCODE_LABEL(WASM_OP_I64_MUL);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_NUMERIC_64(uint64, uint64, I64, *);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_DIV_S)
             {
-                OPCODE_LABEL(WASM_OP_I64_DIV_S);
                 int64 a, b;
 
                 b = POP_I64();
@@ -5703,7 +5543,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_I64_DIV_U)
             {
-                OPCODE_LABEL(WASM_OP_I64_DIV_U);
                 uint64 a, b;
 
                 b = (uint64)POP_I64();
@@ -5718,7 +5557,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_I64_REM_S)
             {
-                OPCODE_LABEL(WASM_OP_I64_REM_S);
                 int64 a, b;
 
                 b = POP_I64();
@@ -5737,7 +5575,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_I64_REM_U)
             {
-                OPCODE_LABEL(WASM_OP_I64_REM_U);
                 uint64 a, b;
 
                 b = (uint64)POP_I64();
@@ -5752,95 +5589,85 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_I64_AND)
             {
-                OPCODE_LABEL(WASM_OP_I64_AND);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_NUMERIC_64(uint64, uint64, I64, &);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_OR)
             {
-                OPCODE_LABEL(WASM_OP_I64_OR);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_NUMERIC_64(uint64, uint64, I64, |);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_XOR)
             {
-                OPCODE_LABEL(WASM_OP_I64_XOR);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_NUMERIC_64(uint64, uint64, I64, ^);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_SHL)
             {
-                OPCODE_LABEL(WASM_OP_I64_SHL);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_NUMERIC2_64(uint64, uint64, I64, <<);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_SHR_S)
             {
-                OPCODE_LABEL(WASM_OP_I64_SHR_S);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_NUMERIC2_64(int64, uint64, I64, >>);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_SHR_U)
             {
-                OPCODE_LABEL(WASM_OP_I64_SHR_U);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 DEF_OP_NUMERIC2_64(uint64, uint64, I64, >>);
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_ROTL)
             {
-                OPCODE_LABEL(WASM_OP_I64_ROTL);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 uint64 a, b;
 
                 b = (uint64)POP_I64();
                 a = (uint64)POP_I64();
                 PUSH_I64(rotl64(a, b));
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_ROTR)
             {
-                OPCODE_LABEL(WASM_OP_I64_ROTR);
-                TRIGGER_ACCELERATOR(frame_ip, 0);
+                // TRIGGER_ACCELERATOR(frame_ip, 0);
                 uint64 a, b;
 
                 b = (uint64)POP_I64();
                 a = (uint64)POP_I64();
                 PUSH_I64(rotr64(a, b));
-                // HANDLE_OP_END();
-                ACCELERATED_OP_END();
+                HANDLE_OP_END();
+                // ACCELERATED_OP_END();
             }
 
             /* numeric instructions of f32 */
             HANDLE_OP(WASM_OP_F32_ABS)
             {
-                OPCODE_LABEL(WASM_OP_F32_ABS);
                 DEF_OP_MATH(float32, F32, fabsf);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_NEG)
             {
-                OPCODE_LABEL(WASM_OP_F32_NEG);
                 uint32 u32 = frame_sp[-1];
                 uint32 sign_bit = u32 & ((uint32)1 << 31);
                 if (sign_bit)
@@ -5852,70 +5679,60 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_F32_CEIL)
             {
-                OPCODE_LABEL(WASM_OP_F32_CEIL);
                 DEF_OP_MATH(float32, F32, ceilf);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_FLOOR)
             {
-                OPCODE_LABEL(WASM_OP_F32_FLOOR);
                 DEF_OP_MATH(float32, F32, floorf);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_TRUNC)
             {
-                OPCODE_LABEL(WASM_OP_F32_TRUNC);
                 DEF_OP_MATH(float32, F32, truncf);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_NEAREST)
             {
-                OPCODE_LABEL(WASM_OP_F32_NEAREST);
                 DEF_OP_MATH(float32, F32, rintf);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_SQRT)
             {
-                OPCODE_LABEL(WASM_OP_F32_SQRT);
                 DEF_OP_MATH(float32, F32, sqrtf);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_ADD)
             {
-                OPCODE_LABEL(WASM_OP_F32_ADD);
                 DEF_OP_NUMERIC(float32, float32, F32, +);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_SUB)
             {
-                OPCODE_LABEL(WASM_OP_F32_SUB);
                 DEF_OP_NUMERIC(float32, float32, F32, -);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_MUL)
             {
-                OPCODE_LABEL(WASM_OP_F32_MUL);
                 DEF_OP_NUMERIC(float32, float32, F32, *);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_DIV)
             {
-                OPCODE_LABEL(WASM_OP_F32_DIV);
                 DEF_OP_NUMERIC(float32, float32, F32, /);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_MIN)
             {
-                OPCODE_LABEL(WASM_OP_F32_MIN);
                 float32 a, b;
 
                 b = POP_F32();
@@ -5927,7 +5744,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_F32_MAX)
             {
-                OPCODE_LABEL(WASM_OP_F32_MAX);
                 float32 a, b;
 
                 b = POP_F32();
@@ -5939,7 +5755,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_F32_COPYSIGN)
             {
-                OPCODE_LABEL(WASM_OP_F32_COPYSIGN);
                 float32 a, b;
 
                 b = POP_F32();
@@ -5951,14 +5766,12 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             /* numeric instructions of f64 */
             HANDLE_OP(WASM_OP_F64_ABS)
             {
-                OPCODE_LABEL(WASM_OP_F64_ABS);
                 DEF_OP_MATH(float64, F64, fabs);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_NEG)
             {
-                OPCODE_LABEL(WASM_OP_F64_NEG);
                 uint64 u64 = GET_I64_FROM_ADDR(frame_sp - 2);
                 uint64 sign_bit = u64 & (((uint64)1) << 63);
                 if (sign_bit)
@@ -5970,70 +5783,60 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_F64_CEIL)
             {
-                OPCODE_LABEL(WASM_OP_F64_CEIL);
                 DEF_OP_MATH(float64, F64, ceil);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_FLOOR)
             {
-                OPCODE_LABEL(WASM_OP_F64_FLOOR);
                 DEF_OP_MATH(float64, F64, floor);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_TRUNC)
             {
-                OPCODE_LABEL(WASM_OP_F64_TRUNC);
                 DEF_OP_MATH(float64, F64, trunc);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_NEAREST)
             {
-                OPCODE_LABEL(WASM_OP_F64_NEAREST);
                 DEF_OP_MATH(float64, F64, rint);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_SQRT)
             {
-                OPCODE_LABEL(WASM_OP_F64_SQRT);
                 DEF_OP_MATH(float64, F64, sqrt);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_ADD)
             {
-                OPCODE_LABEL(WASM_OP_F64_ADD);
                 DEF_OP_NUMERIC_64(float64, float64, F64, +);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_SUB)
             {
-                OPCODE_LABEL(WASM_OP_F64_SUB);
                 DEF_OP_NUMERIC_64(float64, float64, F64, -);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_MUL)
             {
-                OPCODE_LABEL(WASM_OP_F64_MUL);
                 DEF_OP_NUMERIC_64(float64, float64, F64, *);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_DIV)
             {
-                OPCODE_LABEL(WASM_OP_F64_DIV);
                 DEF_OP_NUMERIC_64(float64, float64, F64, /);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_MIN)
             {
-                OPCODE_LABEL(WASM_OP_F64_MIN);
                 float64 a, b;
 
                 b = POP_F64();
@@ -6045,7 +5848,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_F64_MAX)
             {
-                OPCODE_LABEL(WASM_OP_F64_MAX);
                 float64 a, b;
 
                 b = POP_F64();
@@ -6057,7 +5859,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_F64_COPYSIGN)
             {
-                OPCODE_LABEL(WASM_OP_F64_COPYSIGN);
                 float64 a, b;
 
                 b = POP_F64();
@@ -6069,7 +5870,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             /* conversions of i32 */
             HANDLE_OP(WASM_OP_I32_WRAP_I64)
             {
-                OPCODE_LABEL(WASM_OP_I32_WRAP_I64);
                 int32 value = (int32)(POP_I64() & 0xFFFFFFFFLL);
                 PUSH_I32(value);
                 HANDLE_OP_END();
@@ -6077,7 +5877,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_I32_TRUNC_S_F32)
             {
-                OPCODE_LABEL(WASM_OP_I32_TRUNC_S_F32);
                 /* We don't use INT32_MIN/INT32_MAX/UINT32_MIN/UINT32_MAX,
                    since float/double values of ieee754 cannot precisely
                    represent all int32/uint32/int64/uint64 values, e.g.
@@ -6089,14 +5888,12 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_I32_TRUNC_U_F32)
             {
-                OPCODE_LABEL(WASM_OP_I32_TRUNC_U_F32);
                 DEF_OP_TRUNC_F32(-1.0f, 4294967296.0f, true, false);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_TRUNC_S_F64)
             {
-                OPCODE_LABEL(WASM_OP_I32_TRUNC_S_F64);
                 DEF_OP_TRUNC_F64(-2147483649.0, 2147483648.0, true, true);
                 /* frame_sp can't be moved in trunc function, we need to
                   manually adjust it if src and dst op's cell num is
@@ -6107,7 +5904,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_I32_TRUNC_U_F64)
             {
-                OPCODE_LABEL(WASM_OP_I32_TRUNC_U_F64);
                 DEF_OP_TRUNC_F64(-1.0, 4294967296.0, true, false);
                 frame_sp--;
                 HANDLE_OP_END();
@@ -6116,21 +5912,18 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             /* conversions of i64 */
             HANDLE_OP(WASM_OP_I64_EXTEND_S_I32)
             {
-                OPCODE_LABEL(WASM_OP_I64_EXTEND_S_I32);
                 DEF_OP_CONVERT(int64, I64, int32, I32);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_EXTEND_U_I32)
             {
-                OPCODE_LABEL(WASM_OP_I64_EXTEND_U_I32);
                 DEF_OP_CONVERT(int64, I64, uint32, I32);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_TRUNC_S_F32)
             {
-                OPCODE_LABEL(WASM_OP_I64_TRUNC_S_F32);
                 DEF_OP_TRUNC_F32(-9223373136366403584.0f,
                                  9223372036854775808.0f, false, true);
                 frame_sp++;
@@ -6139,7 +5932,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_I64_TRUNC_U_F32)
             {
-                OPCODE_LABEL(WASM_OP_I64_TRUNC_U_F32);
                 DEF_OP_TRUNC_F32(-1.0f, 18446744073709551616.0f, false, false);
                 frame_sp++;
                 HANDLE_OP_END();
@@ -6147,7 +5939,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_I64_TRUNC_S_F64)
             {
-                OPCODE_LABEL(WASM_OP_I64_TRUNC_S_F64);
                 DEF_OP_TRUNC_F64(-9223372036854777856.0, 9223372036854775808.0,
                                  false, true);
                 HANDLE_OP_END();
@@ -6155,7 +5946,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_I64_TRUNC_U_F64)
             {
-                OPCODE_LABEL(WASM_OP_I64_TRUNC_U_F64);
                 DEF_OP_TRUNC_F64(-1.0, 18446744073709551616.0, false, false);
                 HANDLE_OP_END();
             }
@@ -6163,35 +5953,30 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             /* conversions of f32 */
             HANDLE_OP(WASM_OP_F32_CONVERT_S_I32)
             {
-                OPCODE_LABEL(WASM_OP_F32_CONVERT_S_I32);
                 DEF_OP_CONVERT(float32, F32, int32, I32);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_CONVERT_U_I32)
             {
-                OPCODE_LABEL(WASM_OP_F32_CONVERT_U_I32);
                 DEF_OP_CONVERT(float32, F32, uint32, I32);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_CONVERT_S_I64)
             {
-                OPCODE_LABEL(WASM_OP_F32_CONVERT_S_I64);
                 DEF_OP_CONVERT(float32, F32, int64, I64);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_CONVERT_U_I64)
             {
-                OPCODE_LABEL(WASM_OP_F32_CONVERT_U_I64);
                 DEF_OP_CONVERT(float32, F32, uint64, I64);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F32_DEMOTE_F64)
             {
-                OPCODE_LABEL(WASM_OP_F32_DEMOTE_F64);
                 DEF_OP_CONVERT(float32, F32, float64, F64);
                 HANDLE_OP_END();
             }
@@ -6199,35 +5984,30 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             /* conversions of f64 */
             HANDLE_OP(WASM_OP_F64_CONVERT_S_I32)
             {
-                OPCODE_LABEL(WASM_OP_F64_CONVERT_S_I32);
                 DEF_OP_CONVERT(float64, F64, int32, I32);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_CONVERT_U_I32)
             {
-                OPCODE_LABEL(WASM_OP_F64_CONVERT_U_I32);
                 DEF_OP_CONVERT(float64, F64, uint32, I32);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_CONVERT_S_I64)
             {
-                OPCODE_LABEL(WASM_OP_F64_CONVERT_S_I64);
                 DEF_OP_CONVERT(float64, F64, int64, I64);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_CONVERT_U_I64)
             {
-                OPCODE_LABEL(WASM_OP_F64_CONVERT_U_I64);
                 DEF_OP_CONVERT(float64, F64, uint64, I64);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_F64_PROMOTE_F32)
             {
-                OPCODE_LABEL(WASM_OP_F64_PROMOTE_F32);
                 DEF_OP_CONVERT(float64, F64, float32, F32);
                 HANDLE_OP_END();
             }
@@ -6238,48 +6018,41 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             HANDLE_OP(WASM_OP_F32_REINTERPRET_I32)
             HANDLE_OP(WASM_OP_F64_REINTERPRET_I64)
             {
-                OPCODE_LABEL(WASM_OP_F64_REINTERPRET_I64);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_EXTEND8_S)
             {
-                OPCODE_LABEL(WASM_OP_I32_EXTEND8_S);
                 DEF_OP_CONVERT(int32, I32, int8, I32);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I32_EXTEND16_S)
             {
-                OPCODE_LABEL(WASM_OP_I32_EXTEND16_S);
                 DEF_OP_CONVERT(int32, I32, int16, I32);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_EXTEND8_S)
             {
-                OPCODE_LABEL(WASM_OP_I64_EXTEND8_S);
                 DEF_OP_CONVERT(int64, I64, int8, I64);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_EXTEND16_S)
             {
-                OPCODE_LABEL(WASM_OP_I64_EXTEND16_S);
                 DEF_OP_CONVERT(int64, I64, int16, I64);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_I64_EXTEND32_S)
             {
-                OPCODE_LABEL(WASM_OP_I64_EXTEND32_S);
                 DEF_OP_CONVERT(int64, I64, int32, I64);
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_MISC_PREFIX)
             {
-                OPCODE_LABEL(WASM_OP_MISC_PREFIX);
                 uint32 opcode1;
 
                 read_leb_uint32(frame_ip, frame_ip_end, opcode1);
@@ -6776,7 +6549,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 #if WASM_ENABLE_SHARED_MEMORY != 0
             HANDLE_OP(WASM_OP_ATOMIC_PREFIX)
             {
-                OPCODE_LABEL(WASM_OP_ATOMIC_PREFIX);
                 mem_offset_t offset = 0, addr;
                 uint32 align = 0;
                 uint32 opcode1;
@@ -7135,7 +6907,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_IMPDEP)
             {
-                OPCODE_LABEL(WASM_OP_IMPDEP);
                 frame = prev_frame;
                 frame_ip = frame->ip;
                 frame_sp = frame->sp;
@@ -7149,7 +6920,6 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 #if WASM_ENABLE_DEBUG_INTERP != 0
             HANDLE_OP(DEBUG_OP_BREAK)
             {
-                OPCODE_LABEL(DEBUG_OP_BREAK);
                 wasm_cluster_thread_send_signal(exec_env, WAMR_SIG_TRAP);
                 WASM_SUSPEND_FLAGS_FETCH_OR(exec_env->suspend_flags,
                                             WASM_SUSPEND_FLAG_SUSPEND);
@@ -7502,7 +7272,19 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
     || WASM_CPU_SUPPORTS_UNALIGNED_ADDR_ACCESS == 0 \
     || WASM_ENABLE_BULK_MEMORY_OPT != 0
     out_of_bounds:
+#ifdef USE_ACCELERATOR
+        printf("[OOB] frame_ip=%p opcode=0x%x addr=0x%x offset=0x%x size=0x%x sp=%p mem_size=0x%x\n",
+               oob_dbg_frame_ip,
+               oob_dbg_opcode,
+               oob_dbg_addr,
+               oob_dbg_offset,
+               oob_dbg_bytes,
+               oob_dbg_frame_sp,
+               (uint32)get_linear_mem_size());
         wasm_set_exception(module, "out of bounds memory access");
+#else
+        wasm_set_exception(module, "out of bounds memory access");
+#endif
 #endif
 
     got_exception:

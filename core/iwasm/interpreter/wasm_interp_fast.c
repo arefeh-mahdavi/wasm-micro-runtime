@@ -32,7 +32,7 @@ typedef float64 CellType_F64;
 
 #define USE_ACCELERATOR
 
-#ifdef USE_ACCELERATOR
+
     /* Hardware accelerator CSR definitions */
     #define CSR_HANDLER_TBL 0x7C4
     #define CSR_FRAME_IP    0x7C1 
@@ -42,7 +42,7 @@ typedef float64 CellType_F64;
     #define CSR_HANDLER     0x7C2
     #define WASM_JUMP_INST 0x0000007b
 
-
+#ifdef USE_ACCELERATOR
     #define TRIGGER_ACCELERATOR(fip, inc) do { \
         asm volatile("csrw %0, %1" :: "i"(CSR_FRAME_IP), "r"((uint32_t)(uintptr_t)(fip))); \
         asm volatile("csrw %0, %1" :: "i"(CSR_INC),      "r"((uint32_t)(inc)));             \
@@ -1641,6 +1641,11 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
     }
 #endif
 
+void wasm_accelerator_init(void) {
+    // Config=1 for fast mode
+    uint32_t config = 0x1;
+    asm volatile("csrw %0, %1" :: "i"(CSR_CONFIG), "r"(config));
+}
 #ifdef USE_ACCELERATOR
     /* Initialize hardware accelerator (only once, first time called) */
     static int accelerator_initialized = 0;
@@ -1649,6 +1654,9 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
         accelerator_initialized = 1;
     }
 #endif /* USE_ACCELERATOR */
+
+
+
 
 #if WASM_ENABLE_LABELS_AS_VALUES == 0
     while (frame_ip < frame_ip_end) {
@@ -4719,7 +4727,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
             HANDLE_OP(WASM_OP_I64_XOR)
             {
-                TRUIGGER_ACCELERATOR(frame_ip, 6);
+                TRIGGER_ACCELERATOR(frame_ip, 6);
                 DEF_OP_NUMERIC_64(uint64, uint64, I64, ^);
                 // HANDLE_OP_END();
                 ACCELERATED_OP_END();
